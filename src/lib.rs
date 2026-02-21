@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(test, allow(dead_code))]
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
@@ -16,7 +17,7 @@ pub struct SoroSusu;
 
 #[contractimpl]
 impl SoroSusu {
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn init_legacy(env: Env, admin: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::LastActiveTimestamp, &env.ledger().timestamp());
@@ -72,10 +73,11 @@ impl SoroSusu {
         env.storage().instance()
             .get(&DataKey::LastActiveTimestamp)
             .unwrap_or(0)
-#![cfg_attr(test, allow(dead_code))]
+    }
+}
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contractmeta, symbol_short, token, Address, Env, Map, Symbol, Vec,
+    contracterror, contractmeta, symbol_short, Map, Symbol, Vec,
 };
 
 const FEE_BASIS_POINTS_KEY: Symbol = symbol_short!("fee_bps");
@@ -83,6 +85,8 @@ const TREASURY_KEY: Symbol = symbol_short!("treasury");
 const ADMIN_KEY: Symbol = symbol_short!("admin");
 const MEMBERS_KEY: Symbol = symbol_short!("members");
 const CONTRIBS_KEY: Symbol = symbol_short!("contribs");
+const IS_PUBLIC_KEY: Symbol = symbol_short!("is_pub");
+const INVITE_CODE_KEY: Symbol = symbol_short!("inv_code");
 const MAX_BASIS_POINTS: u32 = 10_000;
 
 contractmeta!(
@@ -97,10 +101,12 @@ pub struct SorosusuContracts;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
+    AlreadyJoined = 1003,
     Unauthorized = 1005,
     InvalidFeeConfig = 1006,
     MemberNotFound = 1007,
     PenaltyExceedsContribution = 1008,
+    InvalidInvite = 1009,
 }
 
 #[contractimpl]
@@ -112,6 +118,7 @@ impl SorosusuContracts {
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &0u32);
+        env.storage().instance().set(&IS_PUBLIC_KEY, &true);
         
         // Initialize empty members list and contributions map
         let empty_members: Vec<Address> = Vec::new(&env);
@@ -257,6 +264,59 @@ impl SorosusuContracts {
     
     // NOTE: You will need to build an `add_member` or `deposit` function to populate 
     // the `MEMBERS_KEY` vector and `CONTRIBS_KEY` map.
+
+    /// Set privacy configuration for the circle (Admin only).
+    pub fn set_privacy_config(
+        env: Env,
+        is_public: bool,
+        invite_code: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&IS_PUBLIC_KEY, &is_public);
+        if let Some(code) = invite_code {
+            env.storage().instance().set(&INVITE_CODE_KEY, &code);
+        } else {
+            env.storage().instance().remove(&INVITE_CODE_KEY);
+        }
+        Ok(())
+    }
+
+    /// [Feature] "Public" vs "Private" Groups
+    /// Join the circle
+    pub fn join(env: Env, member: Address, invite_code: Option<u64>) -> Result<(), Error> {
+        member.require_auth();
+
+        let mut members: Vec<Address> = env.storage().instance().get(&MEMBERS_KEY).unwrap_or(Vec::new(&env));
+        
+        if members.contains(&member) {
+            return Err(Error::AlreadyJoined);
+        }
+
+        let is_public: bool = env.storage().instance().get(&IS_PUBLIC_KEY).unwrap_or(true);
+
+        if !is_public {
+            let mut authorized_by_code = false;
+            if let Some(code) = invite_code {
+                if let Some(expected_code) = env.storage().instance().get::<_, u64>(&INVITE_CODE_KEY) {
+                    if code == expected_code {
+                        authorized_by_code = true;
+                    }
+                }
+            }
+            if !authorized_by_code {
+                Self::require_admin(&env)?;
+            }
+        }
+
+        members.push_back(member.clone());
+        env.storage().instance().set(&MEMBERS_KEY, &members);
+
+        let mut contribs: Map<Address, i128> = env.storage().instance().get(&CONTRIBS_KEY).unwrap_or(Map::new(&env));
+        contribs.set(member, 0);
+        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -285,7 +345,7 @@ mod test {
         let (token_client, token_admin) = create_token_contract(&env, &admin);
         token_admin.mint(&user, &1000);
 
-        client.initialize(&admin);
+        client.init_legacy(&admin);
         client.deposit(&user, &token_client.address, &500);
 
         assert_eq!(client.get_user_balance(&user), 500);
@@ -314,7 +374,7 @@ mod test {
         let (token_client, token_admin) = create_token_contract(&env, &admin);
         token_admin.mint(&user, &1000);
 
-        client.initialize(&admin);
+        client.init_legacy(&admin);
         client.deposit(&user, &token_client.address, &500);
 
         client.emergency_withdraw(&user, &token_client.address);
@@ -329,7 +389,7 @@ mod test {
         let contract_id = env.register_contract(None, SoroSusu);
         let client = SoroSusuClient::new(&env, &contract_id);
 
-        client.initialize(&admin);
+        client.init_legacy(&admin);
         let initial_timestamp = client.get_last_active_timestamp();
 
         env.ledger().with_mut(|li| {
@@ -341,8 +401,6 @@ mod test {
 
         assert!(updated_timestamp > initial_timestamp);
     }
-}
-    use soroban_sdk::testutils::Address as _;
 
     fn setup(env: &Env) -> (SorosusuContractsClient, Address) {
         let contract_id = env.register_contract(None, SorosusuContracts);
@@ -358,9 +416,9 @@ mod test {
         client.initialize(&admin);
         let treasury = Address::generate(&env);
         env.mock_all_auths();
-        let result = client.set_protocol_fee(&10_001, &treasury);
+        let result = client.try_set_protocol_fee(&10_001, &treasury);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), Error::InvalidFeeConfig);
+        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidFeeConfig);
     }
 
     #[test]
@@ -373,7 +431,7 @@ mod test {
 
         let treasury = Address::generate(&env);
         env.mock_all_auths();
-        client.set_protocol_fee(&50, &treasury).unwrap();
+        client.set_protocol_fee(&50, &treasury);
         assert_eq!(client.fee_basis_points(), 50);
         assert_eq!(client.treasury_address(), Some(treasury));
     }
@@ -392,5 +450,45 @@ mod test {
         
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().unwrap(), Error::MemberNotFound);
+    }
+
+    #[test]
+    fn test_join_public_circle() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        client.initialize(&admin);
+
+        let member = Address::generate(&env);
+        env.mock_all_auths();
+
+        client.join(&member, &None);
+
+        let res = client.try_join(&member, &None);
+        assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyJoined);
+    }
+
+    #[test]
+    fn test_join_private_circle_with_invite() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        env.mock_all_auths();
+        client.initialize(&admin);
+
+        client.set_privacy_config(&false, &Some(12345));
+
+        let member = Address::generate(&env);
+        client.join(&member, &Some(12345));
+    }
+
+    #[test]
+    fn test_join_private_circle_with_admin_auth() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        env.mock_all_auths(); 
+        client.initialize(&admin);
+        client.set_privacy_config(&false, &Some(12345));
+
+        let member = Address::generate(&env);
+        client.join(&member, &None);
     }
 }

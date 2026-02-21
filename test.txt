@@ -1,0 +1,158 @@
+﻿cargo :    Compiling sorosusu-contracts v0.1.0 (C:\Users\odeye\Desktop\My 
+Projects\OpensrcIssues\sorosusu-contracts)
+At line:1 char:1
++ cargo test --color never 2>&1 | Out-File test.txt -Encoding UTF8
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling so...susu-contracts):String)  
+   [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error[E0252]: the name `contract` is defined multiple times
+  --> src\lib.rs:80:5
+   |
+ 3 | use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+   |                   -------- previous import of the macro `contract` here
+...
+80 |     contract, contracterror, contractimpl, contractmeta, symbol_short, token, 
+Address, Env, Map, Symbol, Vec,
+   |     ^^^^^^^^--
+   |     |
+   |     `contract` reimported here
+   |     help: remove unnecessary import
+   |
+   = note: `contract` must be defined only once in the macro namespace of this module
+
+error[E0252]: the name `contractimpl` is defined multiple times
+  --> src\lib.rs:80:30
+   |
+ 3 | use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+   |                             ------------ previous import of the macro 
+`contractimpl` here
+...
+80 |     contract, contracterror, contractimpl, contractmeta, symbol_short, token, 
+Address, Env, Map, Symbol, Vec,
+   |                              ^^^^^^^^^^^^--
+   |                              |
+   |                              `contractimpl` reimported here
+   |                              help: remove unnecessary import
+   |
+   = note: `contractimpl` must be defined only once in the macro namespace of this 
+module
+
+error[E0252]: the name `token` is defined multiple times
+  --> src\lib.rs:80:72
+   |
+ 3 | use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+   |                                                         ----- previous import of 
+the module `token` here
+...
+80 |     contract, contracterror, contractimpl, contractmeta, symbol_short, token, 
+Address, Env, Map, Symbol, Vec,
+   |                                                                        ^^^^^--
+   |                                                                        |
+   |                                                                        `token` 
+reimported here
+   |                                                                        help: 
+remove unnecessary import
+   |
+   = note: `token` must be defined only once in the type namespace of this module
+
+error[E0252]: the name `Address` is defined multiple times
+  --> src\lib.rs:80:79
+   |
+ 3 | use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+   |                                                                ------- previous 
+import of the type `Address` here
+...
+80 |     contract, contracterror, contractimpl, contractmeta, symbol_short, token, 
+Address, Env, Map, Symbol, Vec,
+   |                                                                               
+^^^^^^^--
+   |                                                                               |
+   |                                                                               
+`Address` reimported here
+   |                                                                               
+help: remove unnecessary import
+   |
+   = note: `Address` must be defined only once in the type namespace of this module
+
+error[E0252]: the name `Env` is defined multiple times
+  --> src\lib.rs:80:88
+   |
+ 3 | use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+   |                                                                         --- 
+previous import of the type `Env` here
+...
+80 |     contract, contracterror, contractimpl, contractmeta, symbol_short, token, 
+Address, Env, Map, Symbol, Vec,
+   |                                                                                    
+    ^^^--
+   |                                                                                    
+    |
+   |                                                                                    
+    `Env` reimported here
+   |                                                                                    
+    help: remove unnecessary import
+   |
+   = note: `Env` must be defined only once in the type namespace of this module
+
+warning: unused imports: `Address`, `Env`, `contract`, `contractimpl`, and `token`
+  --> src\lib.rs:80:5
+   |
+80 |     contract, contracterror, contractimpl, contractmeta, symbol_short, token, 
+Address, Env, Map, Symbol, Vec,
+   |     ^^^^^^^^                 ^^^^^^^^^^^^                              ^^^^^  
+^^^^^^^  ^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated method `soroban_sdk::Env::register_stellar_asset_contract`: 
+use [Env::register_stellar_asset_contract_v2]
+   --> src\lib.rs:328:36
+    |
+328 |         let contract_address = env.register_stellar_asset_contract(admin.clone());
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+error[E0599]: no method named `is_err` found for unit type `()` in the current scope
+   --> src\lib.rs:420:24
+    |
+420 |         assert!(result.is_err());
+    |                        ^^^^^^ method not found in `()`
+
+error[E0599]: no method named `unwrap_err` found for unit type `()` in the current scope
+   --> src\lib.rs:421:27
+    |
+421 |         assert_eq!(result.unwrap_err(), Error::InvalidFeeConfig);
+    |                           ^^^^^^^^^^ method not found in `()`
+
+error[E0599]: no method named `unwrap` found for unit type `()` in the current scope
+   --> src\lib.rs:434:49
+    |
+434 |         client.set_protocol_fee(&50, &treasury).unwrap();
+    |                                                 ^^^^^^ method not found in `()`
+
+error[E0599]: no method named `is_ok` found for unit type `()` in the current scope
+   --> src\lib.rs:464:45
+    |
+464 |         assert!(client.join(&member, &None).is_ok());
+    |                                             ^^^^^ method not found in `()`
+
+error[E0599]: no method named `is_ok` found for unit type `()` in the current scope
+   --> src\lib.rs:480:52
+    |
+480 |         assert!(client.join(&member, &Some(12345)).is_ok());
+    |                                                    ^^^^^ method not found in `()`
+
+error[E0599]: no method named `is_ok` found for unit type `()` in the current scope
+   --> src\lib.rs:492:45
+    |
+492 |         assert!(client.join(&member, &None).is_ok());
+    |                                             ^^^^^ method not found in `()`
+
+Some errors have detailed explanations: E0252, E0599.
+For more information about an error, try `rustc --explain E0252`.
+warning: `sorosusu-contracts` (lib test) generated 2 warnings
+error: could not compile `sorosusu-contracts` (lib test) due to 11 previous errors; 2 
+warnings emitted
