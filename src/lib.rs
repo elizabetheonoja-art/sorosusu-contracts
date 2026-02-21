@@ -8,6 +8,8 @@ use soroban_sdk::{
 const FEE_BASIS_POINTS_KEY: Symbol = symbol_short!("fee_bps");
 const TREASURY_KEY: Symbol = symbol_short!("treasury");
 const ADMIN_KEY: Symbol = symbol_short!("admin");
+const MEMBERS_COUNT_KEY: Symbol = symbol_short!("m_count");
+const MAX_MEMBERS: u32 = 50;
 const MAX_BASIS_POINTS: u32 = 10_000;
 
 contractmeta!(
@@ -24,6 +26,7 @@ pub struct SorosusuContracts;
 pub enum Error {
     Unauthorized = 1005,
     InvalidFeeConfig = 1006,
+    MemberLimitExceeded = 1007,
 }
 
 #[contractimpl]
@@ -99,6 +102,22 @@ impl SorosusuContracts {
         Ok(())
     }
 
+    /// Join a savings circle. Limited to MAX_MEMBERS.
+    pub fn join(env: Env, _user: Address) -> Result<(), Error> {
+        let mut count: u32 = env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0);
+        if count >= MAX_MEMBERS {
+            return Err(Error::MemberLimitExceeded);
+        }
+        count += 1;
+        env.storage().instance().set(&MEMBERS_COUNT_KEY, &count);
+        Ok(())
+    }
+
+    /// Get current member count.
+    pub fn member_count(env: Env) -> u32 {
+        env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0)
+    }
+
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -158,6 +177,33 @@ mod test {
         env.mock_all_auths();
         client.set_protocol_fee(&0, &treasury).unwrap();
         assert_eq!(client.fee_basis_points(), 0);
+    }
+
+    #[test]
+    fn test_member_limit_boundary() {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        client.initialize(&admin);
+
+        // Join 50 members
+        for _ in 0..50 {
+            let user = Address::generate(&env);
+            client.join(&user).unwrap();
+        }
+
+        assert_eq!(client.member_count(), 50);
+
+        // 51st member should fail
+        let user_51 = Address::generate(&env);
+        let result = client.join(&user_51);
+        
+        assert!(result.is_err());
+        // Soroban results in tests are usually Result<Result<(), Error>, Error> or similar if using client
+        // But here we've structured it simply. Let's check the error code.
+        match result {
+            Err(e) => assert_eq!(e, Error::MemberLimitExceeded),
+            _ => panic!("Expected Error::MemberLimitExceeded"),
+        }
     }
 }
 
