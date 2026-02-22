@@ -27,15 +27,6 @@ pub enum DataKey {
 #[derive(Clone)]
 #[contracttype]
 pub struct Circle {
-    pub admin: Address,
-    pub contribution: i128,
-    pub members: Vec<Address>,
-    pub is_random_queue: bool,
-    pub payout_queue: Vec<Address>,
-    pub has_received_payout: Vec<bool>,
-    pub cycle_number: u32,
-    pub current_payout_index: u32,
-    pub total_volume_distributed: i128,
 
 }
 
@@ -98,114 +89,12 @@ fn next_circle_id(env: &Env) -> u32 {
 
 #[contractimpl]
 impl SoroSusu {
-    // ============================================================
-    // GLOBAL ADMIN & FEE LOGIC
-    // ============================================================
 
-    /// Initialize the contract with an admin. Call once after deploy.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
-        if env.storage().instance().has(&ADMIN_KEY) {
-            return Err(Error::Unauthorized);
-        }
-        env.storage().instance().set(&ADMIN_KEY, &admin);
-        env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &0u32);
-        Ok(())
-    }
-
-    /// Set protocol fee (basis points, e.g. 50 = 0.5%) and treasury address. Admin only.
-    pub fn set_protocol_fee(
-        env: Env,
-        fee_basis_points: u32,
-        treasury: Address,
-    ) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        if fee_basis_points > MAX_BASIS_POINTS {
-            return Err(Error::InvalidFeeConfig);
-        }
-        env.storage()
-            .instance()
-            .set(&FEE_BASIS_POINTS_KEY, &fee_basis_points);
-        env.storage().instance().set(&TREASURY_KEY, &treasury);
-        Ok(())
-    }
-
-    pub fn fee_basis_points(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get::<_, u32>(&FEE_BASIS_POINTS_KEY)
-            .unwrap_or(0)
-    }
-
-    pub fn treasury_address(env: Env) -> Option<Address> {
-        env.storage().instance().get::<_, Address>(&TREASURY_KEY)
-    }
-
-    pub fn compute_and_transfer_payout(
-        env: Env,
-        token: Address,
-        from: Address,
-        recipient: Address,
-        gross_payout: i128,
-    ) -> Result<(), Error> {
-        let fee_bps = env
-            .storage()
-            .instance()
-            .get::<_, u32>(&FEE_BASIS_POINTS_KEY)
-            .unwrap_or(0);
-        let fee = if fee_bps == 0 {
-            0_i128
-        } else {
-            (gross_payout * fee_bps as i128) / MAX_BASIS_POINTS as i128
-        };
-        let net_payout = gross_payout - fee;
-
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&from, &recipient, &net_payout);
-
-        if fee > 0 {
-            let treasury: Address = env
-                .storage()
-                .instance()
-                .get::<_, Address>(&TREASURY_KEY)
-                .ok_or(Error::InvalidFeeConfig)?;
-            token_client.transfer(&from, &treasury, &fee);
-        }
-        Ok(())
-    }
-
-    /// Upgrade contract to new WASM binary. Admin only.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        if new_wasm_hash.is_empty() {
-            return Err(Error::InvalidUpgradeHash);
-        }
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        Ok(())
-    }
-
-    // ============================================================
-    // CIRCLE MANAGEMENT & GOVERNANCE
-    // ============================================================
-
-    pub fn create_circle(
-        env: Env,
-        admin: Address,
-        contribution: i128,
-        is_random_queue: bool,
-        token: Option<Address>,
-    ) -> u32 {
-        admin.require_auth();
-        let id = next_circle_id(&env);
         let circle = Circle {
             admin,
             contribution,
             members: Vec::new(&env),
             is_random_queue,
-            payout_queue: Vec::new(&env),
-            has_received_payout: Vec::new(&env),
-            cycle_number: 1,
-            current_payout_index: 0,
-            total_volume_distributed: 0,
 
         };
         write_circle(&env, id, &circle);
@@ -232,8 +121,7 @@ main
         write_circle(&env, circle_id, &circle);
     }
 
-    pub fn process_payout(env: Env, admin: Address, circle_id: u32, recipient: Address) {
-        admin.require_auth();
+
         let mut circle = read_circle(&env, circle_id);
 
         if admin != circle.admin {
@@ -256,6 +144,7 @@ main
         if circle.has_received_payout.get(index).unwrap_or(false) {
             panic_with_error!(&env, Error::PayoutAlreadyReceived);
         }
+
 
         circle.has_received_payout.set(index, true);
         circle.current_payout_index += 1;
@@ -571,4 +460,4 @@ mod test {
         });
         assert!(result.is_err());
     }
-}
+
