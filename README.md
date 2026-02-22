@@ -12,9 +12,20 @@ A trustless Rotating Savings and Credit Association (ROSCA) built on Stellar Sor
 - Deposit USDC/XLM securely
 - Automated payouts (Coming Soon)
 
+## Protocol fee (monetization)
+
+The protocol takes a configurable fee from every payout (e.g. 0.5%).
+
+- **fee_basis_points**: Fee rate in basis points (e.g. `50` = 0.5%). Set via `set_protocol_fee` (admin only). Capped at 10,000 (100%).
+- **treasury_address**: Recipient of the fee. Set together with the fee; required when fee &gt; 0.
+- Payouts deduct the fee from the payout amount: the recipient receives `payout_amount - fee`, and the fee is transferred to `treasury_address`.
+
+After deploy, call `initialize(admin)` once, then `set_protocol_fee(fee_basis_points, treasury)` to enable fees. When implementing the payout flow, use `compute_and_transfer_payout(env, token, from, recipient, gross_payout)` so every payout is fee-deducted and the fee is sent to the treasury.
+
 ## How to Build
 ```bash
 cargo build --target wasm32-unknown-unknown --release
+```
 
 ## Troubleshooting
 
@@ -30,6 +41,7 @@ Code	Error	Description
 1003	AlreadyJoined	Member already part of circle
 1004	CircleNotFound	Invalid circle ID
 1005	Unauthorized	Caller not permitted to perform action
+1006	InvalidFeeConfig	Fee basis points &gt; 10,000 or treasury not set when fee &gt; 0
 1️⃣ Cycle Not Complete
 
 Error: CycleNotComplete
