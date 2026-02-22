@@ -211,7 +211,7 @@
             ],
             "data": {
               "error": {
-                "contract": 1006
+                "contract": 1008
               }
             }
           }
@@ -232,7 +232,7 @@
               },
               {
                 "error": {
-                  "contract": 1006
+                  "contract": 1008
                 }
               }
             ],
@@ -257,7 +257,7 @@
               },
               {
                 "error": {
-                  "contract": 1006
+                  "contract": 1008
                 }
               }
             ],
