@@ -1,374 +1,122 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
-const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+use soroban_sdk::{
+    contract, contractimpl, contracterror, contracttype, panic_with_error, Address, Env, Vec,
+};
 
-#[contracttype]
+const MAX_MEMBERS: u32 = 50;
+
 #[derive(Clone)]
+#[contracttype]
 pub enum DataKey {
-    LastActiveTimestamp,
-    UserBalance(Address),
-    Admin,
+    Circle(u32),
+    CircleCount,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct Circle {
+    admin: Address,
+    contribution: i128,
+    members: Vec<Address>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracterror]
+pub enum Error {
+    CycleNotComplete = 1001,
+    InsufficientAllowance = 1002,
+    AlreadyJoined = 1003,
+    CircleNotFound = 1004,
+    Unauthorized = 1005,
+    MaxMembersReached = 1006,
 }
 
 #[contract]
 pub struct SoroSusu;
 
-#[contractimpl]
-impl SoroSusu {
-    pub fn initialize(env: Env, admin: Address) {
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::LastActiveTimestamp, &env.ledger().timestamp());
+fn read_circle(env: &Env, id: u32) -> Circle {
+    let key = DataKey::Circle(id);
+    let storage = env.storage().instance();
+    match storage.get(&key) {
+        Some(circle) => circle,
+        None => panic_with_error!(env, Error::CircleNotFound),
     }
+}
 
-    pub fn admin_action(env: Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::LastActiveTimestamp, &env.ledger().timestamp());
-    }
+fn write_circle(env: &Env, id: u32, circle: &Circle) {
+    let key = DataKey::Circle(id);
+    let storage = env.storage().instance();
+    storage.set(&key, circle);
+}
 
-    pub fn deposit(env: Env, user: Address, token_address: Address, amount: i128) {
-        user.require_auth();
-        let token_client = token::Client::new(&env, &token_address);
-        token_client.transfer(&user, &env.current_contract_address(), &amount);
-        
-        let current_balance: i128 = env.storage().persistent()
-            .get(&DataKey::UserBalance(user.clone()))
-            .unwrap_or(0);
-        env.storage().persistent().set(&DataKey::UserBalance(user), &(current_balance + amount));
-    }
-
-    pub fn emergency_withdraw(env: Env, user: Address, token_address: Address) {
-        user.require_auth();
-        
-        let last_active: u64 = env.storage().instance()
-            .get(&DataKey::LastActiveTimestamp)
-            .unwrap_or(0);
-        let current_time = env.ledger().timestamp();
-        
-        if current_time <= last_active + SEVEN_DAYS {
-            panic!("Emergency withdrawal not available yet");
-        }
-        
-        let balance: i128 = env.storage().persistent()
-            .get(&DataKey::UserBalance(user.clone()))
-            .unwrap_or(0);
-        
-        if balance > 0 {
-            let token_client = token::Client::new(&env, &token_address);
-            token_client.transfer(&env.current_contract_address(), &user, &balance);
-            env.storage().persistent().remove(&DataKey::UserBalance(user));
-        }
-    }
-
-    pub fn get_user_balance(env: Env, user: Address) -> i128 {
-        env.storage().persistent()
-            .get(&DataKey::UserBalance(user))
-            .unwrap_or(0)
-    }
-
-    pub fn get_last_active_timestamp(env: Env) -> u64 {
-        env.storage().instance()
-            .get(&DataKey::LastActiveTimestamp)
-            .unwrap_or(0)
-#![cfg_attr(test, allow(dead_code))]
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contractmeta, symbol_short, token, Address, Env, Map, Symbol, Vec,
-};
-
-const FEE_BASIS_POINTS_KEY: Symbol = symbol_short!("fee_bps");
-const TREASURY_KEY: Symbol = symbol_short!("treasury");
-const ADMIN_KEY: Symbol = symbol_short!("admin");
-const MEMBERS_COUNT_KEY: Symbol = symbol_short!("m_count");
-const MAX_MEMBERS: u32 = 50;
-const MAX_BASIS_POINTS: u32 = 10_000;
-
-contractmeta!(
-    key = "Description",
-    val = "SoroSusu ROSCA protocol with protocol payout fee"
-);
-
-#[contract]
-pub struct SorosusuContracts;
-
-#[contracterror]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Error {
-    Unauthorized = 1005,
-    InvalidFeeConfig = 1006,
-    MemberLimitExceeded = 1007,
+fn next_circle_id(env: &Env) -> u32 {
+    let key = DataKey::CircleCount;
+    let storage = env.storage().instance();
+    let current: u32 = storage.get(&key).unwrap_or(0);
+    let next = current.saturating_add(1);
+    storage.set(&key, &next);
+    next
 }
 
 #[contractimpl]
-impl SorosusuContracts {
-    /// Initialize the contract with an admin. Call once after deploy.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
-        if env.storage().instance().has(&ADMIN_KEY) {
-            return Err(Error::Unauthorized);
-        }
-        env.storage().instance().set(&ADMIN_KEY, &admin);
-        env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &0u32);
-        
-        // Initialize empty members list and contributions map
-        let empty_members: Vec<Address> = Vec::new(&env);
-        let empty_contribs: Map<Address, i128> = Map::new(&env);
-        env.storage().instance().set(&MEMBERS_KEY, &empty_members);
-        env.storage().instance().set(&CONTRIBS_KEY, &empty_contribs);
-        
-        Ok(())
-    }
-
-    /// Set protocol fee (basis points, e.g. 50 = 0.5%) and treasury address. Admin only.
-    pub fn set_protocol_fee(
-        env: Env,
-        fee_basis_points: u32,
-        treasury: Address,
-    ) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        if fee_basis_points > MAX_BASIS_POINTS {
-            return Err(Error::InvalidFeeConfig);
-        }
-        env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &fee_basis_points);
-        env.storage().instance().set(&TREASURY_KEY, &treasury);
-        Ok(())
-    }
-
-    /// Get current fee basis points.
-    pub fn fee_basis_points(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get::<_, u32>(&FEE_BASIS_POINTS_KEY)
-            .unwrap_or(0)
-    }
-
-    /// Get treasury address.
-    pub fn treasury_address(env: Env) -> Option<Address> {
-        env.storage().instance().get::<_, Address>(&TREASURY_KEY)
-    }
-
-    /// Compute fee from gross amount and perform transfers.
-    pub fn compute_and_transfer_payout(
-        env: Env,
-        token: Address,
-        from: Address,
-        recipient: Address,
-        gross_payout: i128,
-    ) -> Result<(), Error> {
-        let fee_bps = env.storage().instance().get::<_, u32>(&FEE_BASIS_POINTS_KEY).unwrap_or(0);
-        let fee = if fee_bps == 0 {
-            0_i128
-        } else {
-            (gross_payout as i128 * fee_bps as i128) / MAX_BASIS_POINTS as i128
+impl SoroSusu {
+    pub fn create_circle(env: Env, contribution: i128) -> u32 {
+        let admin = env.invoker();
+        let id = next_circle_id(&env);
+        let members = Vec::new(&env);
+        let circle = Circle {
+            admin,
+            contribution,
+            members,
         };
-        let net_payout = gross_payout - fee;
+        write_circle(&env, id, &circle);
+        id
+    }
 
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&from, &recipient, &net_payout);
-
-        if fee > 0 {
-            let treasury: Address = env
-                .storage()
-                .instance()
-                .get::<_, Address>(&TREASURY_KEY)
-                .ok_or(Error::InvalidFeeConfig)?;
-            token_client.transfer(&from, &treasury, &fee);
+    pub fn join_circle(env: Env, circle_id: u32) {
+        let invoker = env.invoker();
+        let mut circle = read_circle(&env, circle_id);
+        for member in circle.members.iter() {
+            if member == invoker {
+                panic_with_error!(&env, Error::AlreadyJoined);
+            }
         }
-
-        Ok(())
-    }
-
-    /// Join a savings circle. Limited to MAX_MEMBERS.
-    pub fn join(env: Env, _user: Address) -> Result<(), Error> {
-        let mut count: u32 = env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0);
-        if count >= MAX_MEMBERS {
-            return Err(Error::MemberLimitExceeded);
+        let member_count: u32 = circle.members.len();
+        if member_count >= MAX_MEMBERS {
+            panic_with_error!(&env, Error::MaxMembersReached);
         }
-        count += 1;
-        env.storage().instance().set(&MEMBERS_COUNT_KEY, &count);
-        Ok(())
+        circle.members.push_back(invoker);
+        write_circle(&env, circle_id, &circle);
     }
-
-    /// Get current member count.
-    pub fn member_count(env: Env) -> u32 {
-        env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0)
-    }
-
-    fn require_admin(env: &Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&ADMIN_KEY)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
-        Ok(())
-    }
-    
-    // NOTE: You will need to build an `add_member` or `deposit` function to populate 
-    // the `MEMBERS_KEY` vector and `CONTRIBS_KEY` map.
 }
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
-
-    fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
-        let contract_address = env.register_stellar_asset_contract(admin.clone());
-        (
-            token::Client::new(env, &contract_address),
-            token::StellarAssetClient::new(env, &contract_address),
-        )
-    }
-
-    #[test]
-    fn test_emergency_withdraw_after_seven_days() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let user = Address::generate(&env);
-        let contract_id = env.register_contract(None, SoroSusu);
-        let client = SoroSusuClient::new(&env, &contract_id);
-
-        let (token_client, token_admin) = create_token_contract(&env, &admin);
-        token_admin.mint(&user, &1000);
-
-        client.initialize(&admin);
-        client.deposit(&user, &token_client.address, &500);
-
-        assert_eq!(client.get_user_balance(&user), 500);
-
-        env.ledger().with_mut(|li| {
-            li.timestamp = li.timestamp + SEVEN_DAYS + 1;
-        });
-
-        client.emergency_withdraw(&user, &token_client.address);
-
-        assert_eq!(client.get_user_balance(&user), 0);
-        assert_eq!(token_client.balance(&user), 1000);
-    }
-
-    #[test]
-    #[should_panic(expected = "Emergency withdrawal not available yet")]
-    fn test_emergency_withdraw_before_seven_days() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let user = Address::generate(&env);
-        let contract_id = env.register_contract(None, SoroSusu);
-        let client = SoroSusuClient::new(&env, &contract_id);
-
-        let (token_client, token_admin) = create_token_contract(&env, &admin);
-        token_admin.mint(&user, &1000);
-
-        client.initialize(&admin);
-        client.deposit(&user, &token_client.address, &500);
-
-        client.emergency_withdraw(&user, &token_client.address);
-    }
-
-    #[test]
-    fn test_admin_action_updates_timestamp() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let contract_id = env.register_contract(None, SoroSusu);
-        let client = SoroSusuClient::new(&env, &contract_id);
-
-        client.initialize(&admin);
-        let initial_timestamp = client.get_last_active_timestamp();
-
-        env.ledger().with_mut(|li| {
-            li.timestamp = li.timestamp + 100;
-        });
-
-        client.admin_action();
-        let updated_timestamp = client.get_last_active_timestamp();
-
-        assert!(updated_timestamp > initial_timestamp);
-    }
-}
     use soroban_sdk::testutils::Address as _;
 
-    fn setup(env: &Env) -> (SorosusuContractsClient, Address) {
-        let contract_id = env.register_contract(None, SorosusuContracts);
-        let admin = Address::generate(env);
-        let client = SorosusuContractsClient::new(env, &contract_id);
-        (client, admin)
-    }
-
     #[test]
-    fn set_protocol_fee_rejects_over_max() {
+    fn join_circle_enforces_max_members() {
         let env = Env::default();
-        let (client, admin) = setup(&env);
-        client.initialize(&admin);
-        let treasury = Address::generate(&env);
-        env.mock_all_auths();
-        let result = client.set_protocol_fee(&10_001, &treasury);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), Error::InvalidFeeConfig);
-    }
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        let contribution = 10_i128;
+        let circle_id = client.create_circle(&contribution);
 
-    #[test]
-    fn fee_basis_points_and_treasury_getters() {
-        let env = Env::default();
-        let (client, admin) = setup(&env);
-        client.initialize(&admin);
-        assert_eq!(client.fee_basis_points(), 0);
-        assert!(client.treasury_address().is_none());
-
-        let treasury = Address::generate(&env);
-        env.mock_all_auths();
-        client.set_protocol_fee(&50, &treasury).unwrap();
-        assert_eq!(client.fee_basis_points(), 50);
-        assert_eq!(client.treasury_address(), Some(treasury));
-    }
-
-    #[test]
-    fn kick_member_fails_if_not_found() {
-        let env = Env::default();
-        let (client, admin) = setup(&env);
-        client.initialize(&admin);
-        
-        let dummy_token = Address::generate(&env);
-        let dummy_member = Address::generate(&env);
-        
-        env.mock_all_auths();
-        let result = client.try_kick_member(&dummy_token, &dummy_member, &0);
-        
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().unwrap(), Error::MemberNotFound);
-    }
-
-    #[test]
-    fn test_member_limit_boundary() {
-        let env = Env::default();
-        let (client, admin) = setup(&env);
-        client.initialize(&admin);
-
-        // Join 50 members
-        for _ in 0..50 {
-            let user = Address::generate(&env);
-            client.join(&user).unwrap();
+        for _ in 0..MAX_MEMBERS {
+            let member = Address::random(&env);
+            env.set_source_account(&member);
+            client.join_circle(&circle_id);
         }
 
-        assert_eq!(client.member_count(), 50);
-
-        // 51st member should fail
-        let user_51 = Address::generate(&env);
-        let result = client.join(&user_51);
-        
+        let extra_member = Address::random(&env);
+        env.set_source_account(&extra_member);
+        let result = std::panic::catch_unwind(|| {
+            client.join_circle(&circle_id);
+        });
         assert!(result.is_err());
-        // Soroban results in tests are usually Result<Result<(), Error>, Error> or similar if using client
-        // But here we've structured it simply. Let's check the error code.
-        match result {
-            Err(e) => assert_eq!(e, Error::MemberLimitExceeded),
-            _ => panic!("Expected Error::MemberLimitExceeded"),
-        }
     }
 }
