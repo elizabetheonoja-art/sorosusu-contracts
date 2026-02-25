@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
+use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
 
 // --- DATA STRUCTURES ---
 
@@ -23,6 +23,7 @@ pub struct Member {
     pub index: u32,
     pub contribution_count: u32,
     pub last_contribution_time: u64,
+    pub is_active: bool,
 }
 
 #[contracttype]
@@ -46,6 +47,7 @@ pub struct CircleInfo {
     pub late_fee_bps: u32,
     pub proposed_late_fee_bps: u32,
     pub proposal_votes_bitmap: u64,
+    pub nft_contract: Address,
 }
 
 // --- CONTRACT TRAIT ---
@@ -55,7 +57,7 @@ pub trait SoroSusuTrait {
     fn init(env: Env, admin: Address);
     
     // Create a new savings circle
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32) -> u64;
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64;
 
     // Join an existing circle
     fn join_circle(env: Env, user: Address, circle_id: u64);
@@ -71,6 +73,15 @@ pub trait SoroSusuTrait {
 
     // Vote on the current proposal
     fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
+
+    // Eject a member (burns NFT)
+    fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
+}
+
+#[contractclient(name = "SusuNftClient")]
+pub trait SusuNftTrait {
+    fn mint(env: Env, to: Address, token_id: u128);
+    fn burn(env: Env, from: Address, token_id: u128);
 }
 
 // --- IMPLEMENTATION ---
@@ -89,7 +100,7 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32) -> u64 {
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64 {
         // 1. Get the current Circle Count
         let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
         
@@ -125,6 +136,7 @@ impl SoroSusuTrait for SoroSusu {
             late_fee_bps: 100, // Default 1%
             proposed_late_fee_bps: 0,
             proposal_votes_bitmap: 0,
+            nft_contract,
         };
 
         // 4. Save the Circle and the new Count
@@ -164,6 +176,7 @@ impl SoroSusuTrait for SoroSusu {
             index: circle.member_count as u32,
             contribution_count: 0,
             last_contribution_time: 0,
+            is_active: true,
         };
         
         // 6. Store the member and update circle count
@@ -172,6 +185,12 @@ impl SoroSusuTrait for SoroSusu {
         
         // 7. Save the updated circle back to storage
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // 8. Mint Participation NFT
+        // Token ID = (CircleID << 64) | MemberIndex
+        let token_id = (circle_id as u128) << 64 | (new_member.index as u128);
+        let client = SusuNftClient::new(&env, &circle.nft_contract);
+        client.mint(&user, &token_id);
     }
 
     fn deposit(env: Env, user: Address, circle_id: u64) {
@@ -185,6 +204,10 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         let mut member: Member = env.storage().instance().get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        if !member.is_active {
+            panic!("Member is ejected");
+        }
 
         // 4. Create the Token Client
         let client = token::Client::new(&env, &circle.token);
@@ -253,6 +276,10 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(member.clone());
         let member_info: Member = env.storage().instance().get(&member_key).unwrap();
 
+        if !member_info.is_active {
+            panic!("Member is ejected");
+        }
+
         // Mark member as contributed in the bitmap
         if (circle.contribution_bitmap & (1 << member_info.index)) != 0 {
             panic!("Member already contributed");
@@ -273,6 +300,10 @@ impl SoroSusuTrait for SoroSusu {
         // Check if user is a member
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
+
+        if !member.is_active {
+            panic!("Member is ejected");
+        }
 
         if new_bps > 10000 {
             panic!("Penalty cannot exceed 100%");
@@ -304,6 +335,10 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
 
+        if !member.is_active {
+            panic!("Member is ejected");
+        }
+
         if circle.proposed_late_fee_bps == 0 {
             panic!("No active proposal");
         }
@@ -318,6 +353,33 @@ impl SoroSusuTrait for SoroSusu {
 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
+
+    fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Only creator can eject
+        if caller != circle.creator {
+            panic!("Unauthorized: Only creator can eject members");
+        }
+
+        let member_key = DataKey::Member(member.clone());
+        let mut member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if !member_info.is_active {
+            panic!("Member already ejected");
+        }
+
+        // Mark as inactive
+        member_info.is_active = false;
+        env.storage().instance().set(&member_key, &member_info);
+
+        // Burn NFT
+        let token_id = (circle_id as u128) << 64 | (member_info.index as u128);
+        let client = SusuNftClient::new(&env, &circle.nft_contract);
+        client.burn(&member, &token_id);
+    }
 }
 
 // --- FUZZ TESTING MODULES ---
@@ -327,6 +389,15 @@ mod fuzz_tests {
     use super::*;
     use soroban_sdk::{testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
     use std::i128;
+
+    #[contract]
+    pub struct MockNft;
+
+    #[contractimpl]
+    impl MockNft {
+        pub fn mint(_env: Env, _to: Address, _id: u128) {}
+        pub fn burn(_env: Env, _from: Address, _id: u128) {}
+    }
 
     #[derive(Arbitrary, Debug, Clone)]
     pub struct FuzzTestCase {
@@ -341,6 +412,7 @@ mod fuzz_tests {
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         // Initialize contract
         SoroSusuTrait::init(env.clone(), admin.clone());
@@ -354,6 +426,7 @@ mod fuzz_tests {
             token.clone(),
             604800, // 1 week in seconds
             0,
+            nft_contract.clone(),
         );
 
         let user1 = Address::generate(&env);
@@ -377,6 +450,7 @@ mod fuzz_tests {
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         // Initialize contract
         SoroSusuTrait::init(env.clone(), admin.clone());
@@ -390,6 +464,7 @@ mod fuzz_tests {
             token.clone(),
             604800, // 1 week in seconds
             0,
+            nft_contract.clone(),
         );
 
         let user2 = Address::generate(&env);
@@ -411,6 +486,7 @@ mod fuzz_tests {
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         // Initialize contract
         SoroSusuTrait::init(env.clone(), admin.clone());
@@ -434,6 +510,7 @@ mod fuzz_tests {
                 token.clone(),
                 604800, // 1 week in seconds
                 0,
+                nft_contract.clone(),
             );
 
             let user = Address::generate(&env);
@@ -469,6 +546,7 @@ mod fuzz_tests {
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         // Initialize contract
         SoroSusuTrait::init(env.clone(), admin.clone());
@@ -489,6 +567,7 @@ mod fuzz_tests {
                 token.clone(),
                 604800, // 1 week in seconds
                 0,
+                nft_contract.clone(),
             );
 
             // Test joining with maximum allowed members
@@ -515,6 +594,7 @@ mod fuzz_tests {
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         // Initialize contract
         SoroSusuTrait::init(env.clone(), admin.clone());
@@ -527,6 +607,7 @@ mod fuzz_tests {
             token.clone(),
             604800, // 1 week in seconds
             0,
+            nft_contract.clone(),
         );
 
         // Create multiple users and test deposits
@@ -558,6 +639,7 @@ mod fuzz_tests {
         let creator = Address::generate(&env);
         let user = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         // Initialize contract
         SoroSusuTrait::init(env.clone(), admin.clone());
@@ -571,6 +653,7 @@ mod fuzz_tests {
             token.clone(),
             604800, // 1 week in seconds
             0,
+            nft_contract.clone(),
         );
 
         // User joins the circle
@@ -615,6 +698,7 @@ mod fuzz_tests {
         let creator = Address::generate(&env);
         let user = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         // Initialize contract
         SoroSusuTrait::init(env.clone(), admin.clone());
@@ -628,6 +712,7 @@ mod fuzz_tests {
             token.clone(),
             604800, // 1 week in seconds
             0,
+            nft_contract.clone(),
         );
 
         // User joins the circle
@@ -662,6 +747,7 @@ mod fuzz_tests {
         let user1 = Address::generate(&env);
         let user2 = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         SoroSusuTrait::init(env.clone(), admin.clone());
 
@@ -674,6 +760,7 @@ mod fuzz_tests {
             token.clone(),
             604800,
             1000, // 10% insurance fee
+            nft_contract.clone(),
         );
 
         SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
@@ -713,6 +800,7 @@ mod fuzz_tests {
         let user2 = Address::generate(&env);
         let user3 = Address::generate(&env);
         let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
 
         SoroSusuTrait::init(env.clone(), admin.clone());
 
@@ -724,6 +812,7 @@ mod fuzz_tests {
             token.clone(),
             604800,
             0,
+            nft_contract.clone(),
         );
 
         SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
@@ -746,5 +835,50 @@ mod fuzz_tests {
         let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         assert_eq!(circle_after.late_fee_bps, 500);
         assert_eq!(circle_after.proposed_late_fee_bps, 0);
+    }
+
+    #[test]
+    fn test_nft_membership() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            0,
+            nft_contract.clone(),
+        );
+
+        // Join should trigger mint (mocked)
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+
+        env.mock_all_auths();
+
+        // Verify member is active
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(member.is_active);
+
+        // Eject member should trigger burn (mocked) and set inactive
+        SoroSusuTrait::eject_member(env.clone(), creator.clone(), circle_id, user.clone());
+
+        let member_after: Member = env.storage().instance().get(&member_key).unwrap();
+        assert!(!member_after.is_active);
+
+        // Inactive member cannot deposit
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
+        });
+        assert!(result.is_err());
     }
 }
