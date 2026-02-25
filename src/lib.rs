@@ -2,12 +2,14 @@
 use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
 
 // --- DATA STRUCTURES ---
+const YIELD_LIQUIDITY_BUFFER_SECS: u64 = 60 * 60;
 const DURATION_CHANGE_NOTICE_SECS: u64 = 72 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    LendingPool,
     Circle(u64),
     Member(Address),
     CircleCount,
@@ -62,6 +64,7 @@ pub struct CircleInfo {
     pub proposed_late_fee_bps: u32,
     pub proposal_votes_bitmap: u64,
     pub nft_contract: Address,
+    pub yield_deposited: u64,
 }
 
 #[contracttype]
@@ -78,6 +81,9 @@ pub struct GroupHealthUpdateEvent {
 pub trait SoroSusuTrait {
     // Initialize the contract
     fn init(env: Env, admin: Address);
+
+    // Set the lending pool used for idle-fund yield strategy (admin only)
+    fn set_lending_pool(env: Env, admin: Address, pool: Address);
     
     // Create a new savings circle
     fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64;
@@ -87,6 +93,12 @@ pub trait SoroSusuTrait {
 
     // Make a deposit (Pay your weekly/monthly due)
     fn deposit(env: Env, user: Address, circle_id: u64);
+
+    // Move idle pot funds to the lending pool.
+    fn deposit_to_yield_pool(env: Env, caller: Address, circle_id: u64, amount: u64);
+
+    // Withdraw all supplied idle funds back to the contract for payouts.
+    fn prepare_payout_liquidity(env: Env, caller: Address, circle_id: u64);
 
     // Trigger insurance to cover a default
     fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
@@ -116,6 +128,12 @@ pub trait SusuNftTrait {
     fn burn(env: Env, from: Address, token_id: u128);
 }
 
+#[contractclient(name = "LendingPoolClient")]
+pub trait LendingPoolTrait {
+    fn supply(env: Env, token: Address, from: Address, amount: u64);
+    fn withdraw(env: Env, token: Address, to: Address, amount: u64);
+}
+
 // --- IMPLEMENTATION ---
 
 #[contract]
@@ -130,6 +148,16 @@ impl SoroSusuTrait for SoroSusu {
         }
         // Set the admin
         env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    fn set_lending_pool(env: Env, admin: Address, pool: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        env.storage().instance().set(&DataKey::LendingPool, &pool);
     }
 
     fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64 {
@@ -171,6 +199,7 @@ impl SoroSusuTrait for SoroSusu {
             proposed_late_fee_bps: 0,
             proposal_votes_bitmap: 0,
             nft_contract,
+            yield_deposited: 0,
         };
 
         // 4. Save the Circle and the new Count
@@ -234,6 +263,20 @@ impl SoroSusuTrait for SoroSusu {
 
         // 2. Load the Circle Data
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let current_time = env.ledger().timestamp();
+
+        // Keep pot liquid before deadline by recalling supplied funds.
+        if circle.yield_deposited > 0 && current_time + YIELD_LIQUIDITY_BUFFER_SECS >= circle.deadline_timestamp {
+            let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
+                .unwrap_or_else(|| panic!("Lending pool not configured"));
+            let lending_client = LendingPoolClient::new(&env, &lending_pool);
+            lending_client.withdraw(
+                &circle.token,
+                &env.current_contract_address(),
+                &circle.yield_deposited,
+            );
+            circle.yield_deposited = 0;
+        }
 
         // 3. Check if user is actually a member
         let member_key = DataKey::Member(user.clone());
@@ -306,6 +349,57 @@ impl SoroSusuTrait for SoroSusu {
         env.events()
             .publish((Symbol::new(&env, "GROUP_HEALTH"), circle_id), health_update);
 
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn deposit_to_yield_pool(env: Env, caller: Address, circle_id: u64, amount: u64) {
+        caller.require_auth();
+        if amount == 0 {
+            panic!("Amount must be greater than zero");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
+            .unwrap_or_else(|| panic!("Lending pool not configured"));
+
+        let lending_client = LendingPoolClient::new(&env, &lending_pool);
+        lending_client.supply(
+            &circle.token,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        circle.yield_deposited += amount;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn prepare_payout_liquidity(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        if circle.yield_deposited == 0 {
+            return;
+        }
+
+        let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
+            .unwrap_or_else(|| panic!("Lending pool not configured"));
+        let lending_client = LendingPoolClient::new(&env, &lending_pool);
+        lending_client.withdraw(
+            &circle.token,
+            &env.current_contract_address(),
+            &circle.yield_deposited,
+        );
+
+        circle.yield_deposited = 0;
         if circle.pending_cycle_duration > 0 && current_time >= circle.duration_change_effective_at {
             circle.cycle_duration = circle.pending_cycle_duration;
             circle.pending_cycle_duration = 0;
@@ -584,6 +678,15 @@ mod fuzz_tests {
     impl MockNft {
         pub fn mint(_env: Env, _to: Address, _id: u128) {}
         pub fn burn(_env: Env, _from: Address, _id: u128) {}
+    }
+
+    #[contract]
+    pub struct MockLendingPool;
+
+    #[contractimpl]
+    impl MockLendingPool {
+        pub fn supply(_env: Env, _token: Address, _from: Address, _amount: u64) {}
+        pub fn withdraw(_env: Env, _token: Address, _to: Address, _amount: u64) {}
     }
 
     #[derive(Arbitrary, Debug, Clone)]
@@ -1072,12 +1175,17 @@ mod fuzz_tests {
     }
 
     #[test]
+    fn test_deposit_to_yield_pool_and_prepare_liquidity() {
     fn test_propose_duration_change_sets_72_hour_notice() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
         let nft_contract = env.register_contract(None, MockNft);
+        let lending_pool = env.register_contract(None, MockLendingPool);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+        SoroSusuTrait::set_lending_pool(env.clone(), admin.clone(), lending_pool.clone());
 
         SoroSusuTrait::init(env.clone(), admin.clone());
 
@@ -1092,6 +1200,15 @@ mod fuzz_tests {
             nft_contract.clone(),
         );
 
+        env.mock_all_auths();
+
+        SoroSusuTrait::deposit_to_yield_pool(env.clone(), creator.clone(), circle_id, 500);
+        let circle_after_supply: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_after_supply.yield_deposited, 500);
+
+        SoroSusuTrait::prepare_payout_liquidity(env.clone(), creator.clone(), circle_id);
+        let circle_after_withdraw: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_after_withdraw.yield_deposited, 0);
         let now = env.ledger().timestamp();
         SoroSusuTrait::propose_duration_change(env.clone(), creator.clone(), circle_id, 2_592_000);
 
