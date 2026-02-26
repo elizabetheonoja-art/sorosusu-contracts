@@ -24,6 +24,10 @@ pub enum DataKey {
     ScheduledPayoutTime(u64),
     // New: Tracks individual contributions for current round (CircleID, MemberIndex)
     CurrentRoundContribution(u64, u32),
+    // New: Tracks buddy pairs (MemberAddress -> BuddyAddress)
+    BuddyPair(Address),
+    // New: Tracks safety deposits for buddy system (MemberAddress, CircleID)
+    SafetyDeposit(Address, u64),
 }
 
 #[contracttype]
@@ -46,6 +50,7 @@ pub struct Member {
     pub status: MemberStatus,
     pub total_contributed: u64,
     pub referrer: Option<Address>,
+    pub buddy: Option<Address>,
 }
 
 #[contracttype]
@@ -145,6 +150,10 @@ pub trait SoroSusuTrait {
     // Request graceful exit from the circle
     fn request_exit(env: Env, user: Address, circle_id: u64);
     fn fill_vacancy(env: Env, new_member: Address, circle_id: u64, exiting_member_address: Address);
+    
+    // Buddy system functions
+    fn pair_with_member(env: Env, user: Address, buddy_address: Address);
+    fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: u64);
 }
 
 // Execute an admin operation when threshold is met
@@ -475,6 +484,7 @@ impl SoroSusuTrait for SoroSusu {
             status: MemberStatus::Active,
             total_contributed: 0,
             referrer,
+            buddy: None,
         };
         
         // 7. Store the member and update circle count
@@ -543,16 +553,46 @@ impl SoroSusuTrait for SoroSusu {
             env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
         }
 
-        // 6. Calculate Insurance Fee and Transfer the full amount from user
+        // 6. Calculate Insurance Fee and attempt payment with buddy system fallback
         let insurance_fee = ((member_contribution_amount as u128 * circle.insurance_fee_bps as u128) / 10000) as u64;
         let total_amount = member_contribution_amount + insurance_fee;
-
         let total_amount_i128 = total_amount as i128;
-        client.transfer(
-            &user, 
-            &env.current_contract_address(), 
-            &total_amount_i128
-        );
+
+        // Try primary member's payment first
+        let payment_result = std::panic::catch_unwind(|| {
+            client.transfer(
+                &user, 
+                &env.current_contract_address(), 
+                &total_amount_i128
+            );
+        });
+
+        let mut used_buddy_deposit = false;
+
+        // If primary payment fails, check buddy's safety deposit
+        if payment_result.is_err() {
+            if let Some(buddy_address) = &member.buddy {
+                let safety_deposit_key = DataKey::SafetyDeposit(buddy_address.clone(), circle_id);
+                if let Some(safety_deposit_amount) = env.storage().instance().get::<DataKey, u64>(&safety_deposit_key) {
+                    if safety_deposit_amount >= total_amount {
+                        // Use buddy's safety deposit
+                        let remaining_deposit = safety_deposit_amount - total_amount;
+                        if remaining_deposit > 0 {
+                            env.storage().instance().set(&safety_deposit_key, &remaining_deposit);
+                        } else {
+                            env.storage().instance().remove(&safety_deposit_key);
+                        }
+                        used_buddy_deposit = true;
+                    } else {
+                        panic!("Primary payment failed and buddy's safety deposit insufficient");
+                    }
+                } else {
+                    panic!("Primary payment failed and no buddy safety deposit available");
+                }
+            } else {
+                panic!("Primary payment failed and no buddy paired");
+            }
+        }
 
         if insurance_fee > 0 {
             circle.insurance_balance += insurance_fee;
@@ -895,6 +935,7 @@ impl SoroSusuTrait for SoroSusu {
             status: MemberStatus::Active,
             total_contributed: 0,
             referrer: None,
+            buddy: None,
         };
 
         // Store the new member
@@ -915,6 +956,62 @@ impl SoroSusuTrait for SoroSusu {
 
         // Mint new NFT for the replacement member
         nft_client.mint(&new_member, &token_id);
+    }
+
+    fn pair_with_member(env: Env, user: Address, buddy_address: Address) {
+        user.require_auth();
+
+        // Check if both users are members
+        let user_key = DataKey::Member(user.clone());
+        let buddy_key = DataKey::Member(buddy_address.clone());
+        
+        let user_member: Member = env.storage().instance().get(&user_key)
+            .unwrap_or_else(|| panic!("User is not a member"));
+        let buddy_member: Member = env.storage().instance().get(&buddy_key)
+            .unwrap_or_else(|| panic!("Buddy is not a member"));
+
+        if user_member.status != MemberStatus::Active || buddy_member.status != MemberStatus::Active {
+            panic!("Both members must be active");
+        }
+
+        // Update user's buddy
+        let mut updated_user = user_member.clone();
+        updated_user.buddy = Some(buddy_address.clone());
+        env.storage().instance().set(&user_key, &updated_user);
+
+        // Store the buddy pair mapping
+        let buddy_pair_key = DataKey::BuddyPair(user.clone());
+        env.storage().instance().set(&buddy_pair_key, &buddy_address);
+    }
+
+    fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: u64) {
+        user.require_auth();
+
+        if amount == 0 {
+            panic!("Safety deposit amount must be greater than zero");
+        }
+
+        // Check if user is a member
+        let user_key = DataKey::Member(user.clone());
+        let user_member: Member = env.storage().instance().get(&user_key)
+            .unwrap_or_else(|| panic!("User is not a member"));
+
+        if user_member.status != MemberStatus::Active {
+            panic!("User must be active");
+        }
+
+        // Get circle info to validate token
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        // Transfer safety deposit from user to contract
+        let token_client = token::Client::new(&env, &circle.token);
+        let amount_i128 = amount as i128;
+        token_client.transfer(&user, &env.current_contract_address(), &amount_i128);
+
+        // Store safety deposit
+        let safety_deposit_key = DataKey::SafetyDeposit(user.clone(), circle_id);
+        env.storage().instance().set(&safety_deposit_key, &amount);
     }
 }
 
