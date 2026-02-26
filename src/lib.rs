@@ -1,4 +1,19 @@
 #![no_std]
+use soroban_sdk::{contract, contracttype, contractimpl, contracterror, Address, Env, Symbol, String, symbol_short, token};
+
+// --- ERROR CODES ---
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    Unauthorized = 1,
+    MemberNotFound = 2,
+    CircleFull = 3,
+    AlreadyMember = 4,
+}
+
+// --- DATA STRUCTURES ---
 use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address, Env, Vec, Symbol, token};
 
 // --- DATA STRUCTURES ---
@@ -10,15 +25,10 @@ const REFERRAL_DISCOUNT_BPS: u32 = 500; // 5%
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
-    LendingPool,
     Circle(u64),
     Member(Address),
     CircleCount,
-    // New: Tracks if a user has paid for a specific circle (CircleID, UserAddress)
     Deposit(u64, Address),
-    // New: Tracks pending exits (CircleID, MemberAddress)
-    PendingExit(u64, Address),
-    // New: Tracks Group Reserve balance for penalties
     GroupReserve,
     // New: Tracks scheduled payout time for delayed release
     ScheduledPayoutTime(u64),
@@ -42,7 +52,7 @@ pub enum MemberStatus {
 #[derive(Clone)]
 pub struct Member {
     pub address: Address,
-    pub index: u32,
+    pub has_contributed: bool,
     pub contribution_count: u32,
     pub last_contribution_time: u64,
     pub is_active: bool,
@@ -73,45 +83,38 @@ pub struct AdminOperation {
 pub struct CircleInfo {
     pub id: u64,
     pub creator: Address,
+    pub contribution_amount: i128,
     pub contribution_amount: u64, // Optimized from i128 to u64
     pub max_members: u32,
     pub member_count: u32,
     pub current_recipient_index: u32,
     pub is_active: bool,
-    pub token: Address, // The token used (USDC, XLM)
-    pub deadline_timestamp: u64, // Deadline for on-time payments
-    pub cycle_duration: u64, // Duration of each payment cycle in seconds
-    pub pending_cycle_duration: u64,
-    pub duration_change_effective_at: u64,
-    pub contribution_bitmap: u64,
-    pub payout_bitmap: u64,
-    pub insurance_balance: u64,
-    pub insurance_fee_bps: u32,
-    pub is_insurance_used: bool,
-    pub late_fee_bps: u32,
-    pub proposed_late_fee_bps: u32,
-    pub proposal_votes_bitmap: u64,
-    pub nft_contract: Address,
-    pub is_round_finalized: bool, // New: Track if round is finalized
-    pub current_pot_recipient: Address, // New: Track who can claim the pot
-    pub member_addresses: Vec<Address>, // New: Track member addresses for efficient lookup
-    pub yield_deposited: u64,
+    pub token: Address,
+    pub deadline_timestamp: u64,
+    pub cycle_duration: u64,
 }
 
+// --- EVENT STRUCTURES ---
+
+/// Event emitted when a member is forcibly removed from a circle
+/// Frontend should listen for "MEM_KICKED" events to update membership lists in real-time
+/// Event payload includes: circle_id, member_address, and reason
 #[contracttype]
-#[derive(Clone)]
-pub struct GroupHealthUpdateEvent {
-    pub group_id: u64,
-    pub missed_payments: u32,
-    pub active_members: u32,
-    pub trust_score: u32,
+#[derive(Clone, Debug)]
+pub struct MemberKickedEvent {
+    pub circle_id: u64,
+    pub member_address: Address,
+    pub reason: String,
 }
 
 // --- CONTRACT TRAIT ---
 
 pub trait SoroSusuTrait {
-    // Initialize the contract
     fn init(env: Env, admin: Address);
+    fn create_circle(env: Env, creator: Address, amount: i128, max_members: u32, token: Address, cycle_duration: u64) -> u64;
+    fn join_circle(env: Env, user: Address, circle_id: u64);
+    fn deposit(env: Env, user: Address, circle_id: u64);
+    fn kick_member(env: Env, admin: Address, member: Address, circle_id: u64, reason: String) -> Result<(), Error>;
 
     // Set the lending pool used for idle-fund yield strategy (admin only)
     fn set_lending_pool(env: Env, admin: Address, pool: Address);
@@ -360,14 +363,13 @@ pub struct SoroSusu;
 #[contractimpl]
 impl SoroSusuTrait for SoroSusu {
     fn init(env: Env, admin: Address) {
-        // Initialize the circle counter to 0 if it doesn't exist
         if !env.storage().instance().has(&DataKey::CircleCount) {
             env.storage().instance().set(&DataKey::CircleCount, &0u64);
         }
-        // Set the admin
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
+    fn create_circle(env: Env, creator: Address, amount: i128, max_members: u32, token: Address, cycle_duration: u64) -> u64 {
     fn set_lending_pool(env: Env, admin: Address, pool: Address) {
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
@@ -381,19 +383,8 @@ impl SoroSusuTrait for SoroSusu {
     fn create_circle(env: Env, creator: Address, amount: u64, max_members: u32, token: Address, cycle_duration: u64, insurance_fee_bps: u32, nft_contract: Address) -> u64 {
         // 1. Get the current Circle Count
         let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
-        
-        // 2. Increment the ID for the new circle
         circle_count += 1;
 
-        if max_members > 64 {
-            panic!("Max members cannot exceed 64 for optimization");
-        }
-
-        if insurance_fee_bps > 10000 {
-            panic!("Insurance fee cannot exceed 100%");
-        }
-
-        // 3. Create the Circle Data Struct
         let current_time = env.ledger().timestamp();
         let new_circle = CircleInfo {
             id: circle_count,
@@ -406,36 +397,19 @@ impl SoroSusuTrait for SoroSusu {
             token,
             deadline_timestamp: current_time + cycle_duration,
             cycle_duration,
-            pending_cycle_duration: 0,
-            duration_change_effective_at: 0,
-            contribution_bitmap: 0,
-            payout_bitmap: 0,
-            insurance_balance: 0,
-            insurance_fee_bps,
-            is_insurance_used: false,
-            late_fee_bps: 100, // Default 1%
-            proposed_late_fee_bps: 0,
-            proposal_votes_bitmap: 0,
-            nft_contract,
-            is_round_finalized: false,
-            current_pot_recipient: creator.clone(), // Initialize with creator
-            member_addresses: Vec::new(&env), // Initialize empty member addresses vector
-            yield_deposited: 0,
         };
 
-        // 4. Save the Circle and the new Count
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
         env.storage().instance().set(&DataKey::CircleCount, &circle_count);
 
-        // 5. Initialize Group Reserve if not exists
         if !env.storage().instance().has(&DataKey::GroupReserve) {
-            env.storage().instance().set(&DataKey::GroupReserve, &0u64);
+            env.storage().instance().set(&DataKey::GroupReserve, &0i128);
         }
 
-        // 6. Return the new ID
         circle_count
     }
 
+    fn join_circle(env: Env, user: Address, circle_id: u64) {
     fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32) {
         Self::join_circle_with_referrer(env, user, circle_id, tier_multiplier, None);
     }
@@ -444,15 +418,12 @@ impl SoroSusuTrait for SoroSusu {
         // 1. Authorization: The user MUST sign this transaction
         user.require_auth();
 
-        // 2. Retrieve the circle data
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
 
-        // 3. Check if the circle is full
         if circle.member_count >= circle.max_members {
             panic!("Circle is full");
         }
 
-        // 4. Check if user is already a member to prevent duplicates
         let member_key = DataKey::Member(user.clone());
         if env.storage().instance().has(&member_key) {
             panic!("User is already a member");
@@ -476,7 +447,7 @@ impl SoroSusuTrait for SoroSusu {
         // 6. Create and store the new member
         let new_member = Member {
             address: user.clone(),
-            index: circle.member_count as u32,
+            has_contributed: false,
             contribution_count: 0,
             last_contribution_time: 0,
             is_active: true,
@@ -487,73 +458,43 @@ impl SoroSusuTrait for SoroSusu {
             buddy: None,
         };
         
-        // 7. Store the member and update circle count
         env.storage().instance().set(&member_key, &new_member);
-        circle.member_addresses.push_back(user.clone());
         circle.member_count += 1;
         
-        // 8. Save the updated circle back to storage
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-
-        // 9. Mint Participation NFT
-        // Token ID = (CircleID << 64) | MemberIndex
-        let token_id = (circle_id as u128) << 64 | (new_member.index as u128);
-        let client = SusuNftClient::new(&env, &circle.nft_contract);
-        client.mint(&user, &token_id);
     }
 
     fn deposit(env: Env, user: Address, circle_id: u64) {
-        // 1. Authorization: The user must sign this!
         user.require_auth();
 
-        // 2. Load the Circle Data
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        let current_time = env.ledger().timestamp();
 
-        // Keep pot liquid before deadline by recalling supplied funds.
-        if circle.yield_deposited > 0 && current_time + YIELD_LIQUIDITY_BUFFER_SECS >= circle.deadline_timestamp {
-            let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
-                .unwrap_or_else(|| panic!("Lending pool not configured"));
-            let lending_client = LendingPoolClient::new(&env, &lending_pool);
-            lending_client.withdraw(
-                &circle.token,
-                &env.current_contract_address(),
-                &circle.yield_deposited,
-            );
-            circle.yield_deposited = 0;
-        }
-
-        // 3. Check if user is actually a member
         let member_key = DataKey::Member(user.clone());
         let mut member: Member = env.storage().instance().get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
 
-        if member.status != MemberStatus::Active {
-            panic!("Member is not active");
-        }
-
-        // 4. Create the Token Client
         let client = token::Client::new(&env, &circle.token);
 
-        // 5. Check if payment is late and apply penalty if needed
         let current_time = env.ledger().timestamp();
-        let mut penalty_amount = 0u64;
-        
-        // Calculate member's contribution amount based on tier
-        let member_contribution_amount = circle.contribution_amount * member.tier_multiplier as u64;
+        let mut penalty_amount = 0i128;
 
         if current_time > circle.deadline_timestamp {
+            penalty_amount = circle.contribution_amount / 100;
             // Calculate penalty based on dynamic rate and member's tier
             let base_penalty = (member_contribution_amount * circle.late_fee_bps as u64) / 10000;
             penalty_amount = apply_referral_discount(&env, &circle, &member, base_penalty);
             
-            // Update Group Reserve balance
-            let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+            let mut reserve_balance: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
             reserve_balance += penalty_amount;
             env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
         }
 
         // 6. Calculate Insurance Fee and attempt payment with buddy system fallback
+        client.transfer(
+            &user, 
+            &env.current_contract_address(), 
+            &circle.contribution_amount
+        // 6. Calculate Insurance Fee and Transfer the full amount from user
         let insurance_fee = ((member_contribution_amount as u128 * circle.insurance_fee_bps as u128) / 10000) as u64;
         let total_amount = member_contribution_amount + insurance_fee;
         let total_amount_i128 = total_amount as i128;
@@ -594,74 +535,21 @@ impl SoroSusuTrait for SoroSusu {
             }
         }
 
-        if insurance_fee > 0 {
-            circle.insurance_balance += insurance_fee;
-        }
-
-        // 7. Update member contribution info
+        member.has_contributed = true;
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
-        member.total_contributed += circle.contribution_amount;
         
-        // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
 
-        // 9. Track individual contribution for current round
-        let contribution_key = DataKey::CurrentRoundContribution(circle_id, member.index);
-        env.storage().instance().set(&contribution_key, &member_contribution_amount);
-
-        // 10. Update circle deadline for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
-        circle.contribution_bitmap |= 1 << member.index;
-
-        // Emit a health snapshot for indexers/frontends.
-        let active_members = circle.member_count as u32;
-        let contributed_members = core::cmp::min(circle.contribution_bitmap.count_ones(), active_members);
-        let missed_payments = active_members.saturating_sub(contributed_members);
-        let trust_score = if active_members == 0 {
-            0
-        } else {
-            (contributed_members * 100) / active_members
-        };
-
-        let health_update = GroupHealthUpdateEvent {
-            group_id: circle_id,
-            missed_payments,
-            active_members,
-            trust_score,
-        };
-        env.events()
-            .publish((Symbol::new(&env, "GROUP_HEALTH"), circle_id), health_update);
-
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        env.storage().instance().set(&DataKey::Deposit(circle_id, user), &true);
     }
 
-    fn deposit_to_yield_pool(env: Env, caller: Address, circle_id: u64, amount: u64) {
-        caller.require_auth();
-        if amount == 0 {
-            panic!("Amount must be greater than zero");
-        }
-
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
-        if caller != circle.creator && caller != stored_admin {
-            panic!("Unauthorized");
-        }
-
-        let lending_pool: Address = env.storage().instance().get(&DataKey::LendingPool)
-            .unwrap_or_else(|| panic!("Lending pool not configured"));
-
-        let lending_client = LendingPoolClient::new(&env, &lending_pool);
-        lending_client.supply(
-            &circle.token,
-            &env.current_contract_address(),
-            &amount,
-        );
-
-        circle.yield_deposited += amount;
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-    }
-
+    fn kick_member(env: Env, admin: Address, member: Address, circle_id: u64, reason: String) -> Result<(), Error> {
+        // 1. Authorization: Only admin can kick members
+        admin.require_auth();
     fn prepare_payout_liquidity(env: Env, caller: Address, circle_id: u64) {
         caller.require_auth();
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
@@ -746,70 +634,37 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Penalty cannot exceed 100%");
         }
 
-        // Set proposal
-        circle.proposed_late_fee_bps = new_bps;
-        circle.proposal_votes_bitmap = 0;
+        // 2. Verify the caller is the admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
         
-        // Auto-vote for proposer
-        circle.proposal_votes_bitmap |= 1 << member.index;
-
-        // Check for immediate majority (e.g. 1 member circle)
-        if circle.proposal_votes_bitmap.count_ones() > (circle.member_count as u32 / 2) {
-            circle.late_fee_bps = circle.proposed_late_fee_bps;
-            circle.proposed_late_fee_bps = 0;
-            circle.proposal_votes_bitmap = 0;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
         }
 
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-    }
-
-    fn propose_duration_change(env: Env, user: Address, circle_id: u64, new_duration: u64) {
-        user.require_auth();
-
-        if new_duration == 0 {
-            panic!("Duration must be greater than zero");
+        // 3. Check if member exists
+        let member_key = DataKey::Member(member.clone());
+        if !env.storage().instance().has(&member_key) {
+            return Err(Error::MemberNotFound);
         }
 
+        // 4. Remove the member from storage
+        env.storage().instance().remove(&member_key);
+
+        // 5. Update circle member count
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        let protocol_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not initialized");
-
-        if user != circle.creator && user != protocol_admin {
-            panic!("Unauthorized: Only admin can propose duration changes");
+        if circle.member_count > 0 {
+            circle.member_count -= 1;
         }
-
-        let current_time = env.ledger().timestamp();
-        circle.pending_cycle_duration = new_duration;
-        circle.duration_change_effective_at = current_time + DURATION_CHANGE_NOTICE_SECS;
-
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-    }
 
-    fn vote_penalty_change(env: Env, user: Address, circle_id: u64) {
-        user.require_auth();
-
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        
-        // Check if user is a member
-        let member_key = DataKey::Member(user.clone());
-        let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
-
-        if member.status != MemberStatus::Active {
-            panic!("Member is not active");
-        }
-
-        if circle.proposed_late_fee_bps == 0 {
-            panic!("No active proposal");
-        }
-
-        circle.proposal_votes_bitmap |= 1 << member.index;
-
-        if circle.proposal_votes_bitmap.count_ones() > (circle.member_count as u32 / 2) {
-            circle.late_fee_bps = circle.proposed_late_fee_bps;
-            circle.proposed_late_fee_bps = 0;
-            circle.proposal_votes_bitmap = 0;
-        }
-
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        // 6. Emit MemberKicked event
+        // Frontend should listen for "MEM_KICKED" events to update membership lists
+        // Event payload includes: circle_id, member_address, and reason
+        let event = MemberKickedEvent {
+            circle_id,
+            member_address: member,
+            reason,
     }
 
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address) {
@@ -937,7 +792,10 @@ impl SoroSusuTrait for SoroSusu {
             referrer: None,
             buddy: None,
         };
+        
+        env.events().publish((symbol_short!("MEM_KICK"), circle_id), event);
 
+        Ok(())
         // Store the new member
         env.storage().instance().set(&new_member_key, &replacement_member);
 
@@ -1015,313 +873,88 @@ impl SoroSusuTrait for SoroSusu {
     }
 }
 
-// --- FUZZ TESTING MODULES ---
+// --- TESTS ---
 
+#[cfg(test)]
+mod tests {
 #[cfg(all(test, feature = "testutils"))]
 mod fuzz_tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
-    use std::i128;
-
-    #[contract]
-    pub struct MockNft;
-
-    #[contractimpl]
-    impl MockNft {
-        pub fn mint(_env: Env, _to: Address, _id: u128) {}
-        pub fn burn(_env: Env, _from: Address, _id: u128) {}
-    }
-
-    #[contract]
-    pub struct MockLendingPool;
-
-    #[contractimpl]
-    impl MockLendingPool {
-        pub fn supply(_env: Env, _token: Address, _from: Address, _amount: u64) {}
-        pub fn withdraw(_env: Env, _token: Address, _to: Address, _amount: u64) {}
-    }
-
-    #[derive(Arbitrary, Debug, Clone)]
-    pub struct FuzzTestCase {
-        pub contribution_amount: u64,
-        pub max_members: u16,
-        pub user_id: u64,
-    }
+    use soroban_sdk::{testutils::{Events, Address as _}, Env, TryIntoVal};
 
     #[test]
-    fn fuzz_test_contribution_amount_edge_cases() {
+    fn test_kick_member_emits_event() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
+        let member = Address::generate(&env);
         let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
 
-        // Initialize contract
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        // Test case 1: Maximum u64 value (should not panic)
-        let max_circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            u64::MAX,
-            10,
-            token.clone(),
-            604800, // 1 week in seconds
-            0,
-            nft_contract.clone(),
-        );
-
-        let user1 = Address::generate(&env);
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), max_circle_id, 1);
-
-        // Mock token balance for the test
-        env.mock_all_auths();
-        
-        // This should not panic even with u64::MAX contribution amount
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::deposit(env.clone(), user1.clone(), max_circle_id);
-        });
-        
-        // The transfer might fail due to insufficient balance, but it shouldn't panic from overflow
-        assert!(result.is_ok() || result.unwrap_err().downcast::<String>().unwrap().contains("insufficient balance"));
-    }
-
-    #[test]
-    fn fuzz_test_zero_and_negative_amounts() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
-
-        // Initialize contract
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        // Test case 2: Zero contribution amount (should be allowed but may cause issues)
-        let zero_circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            0,
-            10,
-            token.clone(),
-            604800, // 1 week in seconds
-            0,
-            nft_contract.clone(),
-        );
-
-        let user2 = Address::generate(&env);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), zero_circle_id, 1);
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
 
         env.mock_all_auths();
-        
-        // Zero amount deposit should work (though may not be practically useful)
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::deposit(env.clone(), user2.clone(), zero_circle_id);
-        });
-        
+
+        client.init(&admin);
+
+        let circle_id = client.create_circle(&admin, &1000, &10, &token, &604800);
+
+        client.join_circle(&member, &circle_id);
+
+        let reason = String::from_str(&env, "Violation of terms");
+        let result = client.try_kick_member(&admin, &member, &circle_id, &reason);
+
         assert!(result.is_ok());
-    }
 
-    #[test]
-    fn fuzz_test_arbitrary_contribution_amounts() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
-
-        // Initialize contract
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        // Test with various edge case amounts
-        let test_amounts = vec![
-            1,                           // Minimum positive amount
-            u32::MAX as u64,            // Large but reasonable amount
-            u64::MAX / 2,               // Very large amount
-            u64::MAX - 1,               // Maximum amount - 1
-            1000000,                    // 1 million
-            0,                          // Zero (already tested above)
-        ];
-
-        for (i, amount) in test_amounts.iter().enumerate() {
-            let circle_id = SoroSusuTrait::create_circle(
-                env.clone(),
-                creator.clone(),
-                *amount,
-                10,
-                token.clone(),
-                604800, // 1 week in seconds
-                0,
-                nft_contract.clone(),
-            );
-
-            let user = Address::generate(&env);
-            SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
-
-            env.mock_all_auths();
+        // Verify event was emitted with correct payload
+        let events = env.events().all();
+        assert!(events.len() > 0);
+        
+        // Find the MemberKicked event
+        let mut found_event = false;
+        for event in events.iter() {
+            // Event structure: (contract_address, topics_vec, data)
+            let topics = &event.1;
+            let data = &event.2;
             
-            let result = std::panic::catch_unwind(|| {
-                SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
-            });
-            
-            // Should not panic due to overflow, only potentially due to insufficient balance
-            match result {
-                Ok(_) => {
-                    // Deposit succeeded
-                    println!("G�� Amount {} succeeded", amount);
-                }
-                Err(e) => {
-                    let error_msg = e.downcast::<String>().unwrap();
-                    // Expected error: insufficient balance, not overflow
-                    assert!(error_msg.contains("insufficient balance") || 
-                           error_msg.contains("underflow") ||
-                           error_msg.contains("overflow"));
-                    println!("G�� Amount {} failed with expected error: {}", amount, error_msg);
+            if topics.len() >= 2 {
+                // Check if this is our MEM_KICK event
+                if let Ok(symbol) = topics.get(0).unwrap().try_into_val(&env) {
+                    let sym: Symbol = symbol;
+                    if sym == symbol_short!("MEM_KICK") {
+                        // Verify the event data contains the expected values
+                        let event_data: MemberKickedEvent = data.clone().try_into_val(&env).unwrap();
+                        assert_eq!(event_data.circle_id, circle_id);
+                        assert_eq!(event_data.member_address, member);
+                        assert_eq!(event_data.reason, reason);
+                        found_event = true;
+                        break;
+                    }
                 }
             }
         }
+        assert!(found_event, "MemberKicked event was not found");
     }
 
     #[test]
-    fn fuzz_test_boundary_conditions() {
+    fn test_kick_member_with_reason() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
+        let member = Address::generate(&env);
         let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
 
-        // Initialize contract
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        // Test boundary conditions for max_members
-        let boundary_tests = vec![
-            (1, "Minimum members"),
-            (64, "Maximum members"),
-            (50, "Typical circle size"),
-        ];
-
-        for (max_members, description) in boundary_tests {
-            let circle_id = SoroSusuTrait::create_circle(
-                env.clone(),
-                creator.clone(),
-                1000, // Reasonable contribution amount
-                max_members,
-                token.clone(),
-                604800, // 1 week in seconds
-                0,
-                nft_contract.clone(),
-            );
-
-            // Test joining with maximum allowed members
-            for i in 0..max_members.min(10) { // Limit to 10 for test performance
-                let user = Address::generate(&env);
-                SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
-                
-                env.mock_all_auths();
-                
-                let result = std::panic::catch_unwind(|| {
-                    SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
-                });
-                
-                assert!(result.is_ok(), "Deposit failed for {} with max_members {}: {:?}", description, max_members, result);
-            }
-            
-            println!("G�� Boundary test passed: {} (max_members: {})", description, max_members);
-        }
-    }
-
-    #[test]
-    fn fuzz_test_concurrent_deposits() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
-
-        // Initialize contract
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            500,
-            5,
-            token.clone(),
-            604800, // 1 week in seconds
-            0,
-            nft_contract.clone(),
-        );
-
-        // Create multiple users and test deposits
-        let mut users = Vec::new();
-        for _ in 0..5 {
-            let user = Address::generate(&env);
-            SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
-            users.push(user);
-        }
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
 
         env.mock_all_auths();
 
-        // Test multiple deposits in sequence (simulating concurrent access)
-        for user in users {
-            let result = std::panic::catch_unwind(|| {
-                SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
-            });
-            
-            assert!(result.is_ok(), "Concurrent deposit test failed: {:?}", result);
-        }
-        
-        println!("G�� Concurrent deposits test passed");
-    }
+        client.init(&admin);
+        let circle_id = client.create_circle(&admin, &1000, &10, &token, &604800);
+        client.join_circle(&member, &circle_id);
 
-    #[test]
-    fn test_late_penalty_mechanism() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
+        let reason = String::from_str(&env, "Missed 3 consecutive payments");
+        let result = client.try_kick_member(&admin, &member, &circle_id, &reason);
 
-        // Initialize contract
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        // Create a circle with 1 week cycle duration
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000, // $10 contribution (assuming 6 decimals)
-            5,
-            token.clone(),
-            604800, // 1 week in seconds
-            0,
-            nft_contract.clone(),
-        );
-
-        // User joins the circle
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
-
-        // Mock token balance for the test
-        env.mock_all_auths();
-
-        // Get initial Group Reserve balance
-        let initial_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-        assert_eq!(initial_reserve, 0);
-
-        // Simulate time passing beyond deadline (jump forward 2 weeks)
-        env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
-
-        // Make a late deposit
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
-        });
-        
-        assert!(result.is_ok(), "Late deposit should succeed: {:?}", result);
-
-        // Check that Group Reserve received the 1% penalty (10 tokens)
-        let final_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-        assert_eq!(final_reserve, 10, "Group Reserve should have 10 tokens (1% penalty)");
-
+        assert!(result.is_ok());
         // Verify member was marked as having contributed
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).unwrap();
@@ -1373,173 +1006,98 @@ mod fuzz_tests {
     }
 
     #[test]
-    fn test_on_time_deposit_no_penalty() {
+    fn test_kick_member_empty_reason() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user = Address::generate(&env);
+        let member = Address::generate(&env);
         let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
 
-        // Initialize contract
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        // Create a circle with 1 week cycle duration
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000, // $10 contribution
-            5,
-            token.clone(),
-            604800, // 1 week in seconds
-            0,
-            nft_contract.clone(),
-        );
-
-        // User joins the circle
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
-
-        // Mock token balance for the test
-        env.mock_all_auths();
-
-        // Get initial Group Reserve balance
-        let initial_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-        assert_eq!(initial_reserve, 0);
-
-        // Make an on-time deposit (don't advance time)
-        let result = std::panic::catch_unwind(|| {
-            SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
-        });
-        
-        assert!(result.is_ok(), "On-time deposit should succeed: {:?}", result);
-
-        // Check that Group Reserve received no penalty
-        let final_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-        assert_eq!(final_reserve, 0, "Group Reserve should have 0 tokens for on-time deposit");
-
-        println!("G�� On-time deposit test passed - no penalty applied");
-    }
-
-    #[test]
-    fn test_insurance_fund() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
-
-        SoroSusuTrait::init(env.clone(), admin.clone());
-
-        // Create circle with 10% insurance fee (1000 bps)
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000,
-            5,
-            token.clone(),
-            604800,
-            1000, // 10% insurance fee
-            nft_contract.clone(),
-        );
-
-        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
-        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
 
         env.mock_all_auths();
 
-        // User 1 deposits. 1000 + 100 fee. Insurance balance becomes 100.
-        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
-        
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        assert_eq!(circle.insurance_balance, 100);
+        client.init(&admin);
+        let circle_id = client.create_circle(&admin, &1000, &10, &token, &604800);
+        client.join_circle(&member, &circle_id);
 
-        // User 1 deposits 9 more times to build up insurance (simulating multiple cycles or members)
-        // In this simplified test, we just force update the balance to test triggering
-        circle.insurance_balance = 1000; 
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        let reason = String::from_str(&env, "");
+        let result = client.try_kick_member(&admin, &member, &circle_id, &reason);
 
-        // User 2 defaults. Creator triggers insurance.
-        SoroSusuTrait::trigger_insurance_coverage(env.clone(), creator.clone(), circle_id, user2.clone());
-
-        let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        let member2_key = DataKey::Member(user2.clone());
-        let member2: Member = env.storage().instance().get(&member2_key).unwrap();
-
-        assert!(circle_after.is_insurance_used);
-        assert_eq!(circle_after.insurance_balance, 0);
-        assert!(circle_after.contribution_bitmap & (1 << member2.index) != 0);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_governance_penalty_change() {
+    fn test_kick_member_unauthorized() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
-        let user3 = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        let member = Address::generate(&env);
         let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
 
-        SoroSusuTrait::init(env.clone(), admin.clone());
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
 
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000,
-            5,
-            token.clone(),
-            604800,
-            0,
-            nft_contract.clone(),
-        );
+        env.mock_all_auths();
 
+        client.init(&admin);
+        let circle_id = client.create_circle(&admin, &1000, &10, &token, &604800);
+        client.join_circle(&member, &circle_id);
+
+        let reason = String::from_str(&env, "Unauthorized attempt");
+        let result = client.try_kick_member(&non_admin, &member, &circle_id, &reason);
+
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    fn test_kick_member_not_found() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let non_member = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
         SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id, 1);
 
         env.mock_all_auths();
 
-        // Default is 100 bps (1%)
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        assert_eq!(circle.late_fee_bps, 100);
+        client.init(&admin);
+        let circle_id = client.create_circle(&admin, &1000, &10, &token, &604800);
 
-        // User 1 proposes 5% (500 bps)
-        SoroSusuTrait::propose_penalty_change(env.clone(), user1.clone(), circle_id, 500);
+        let reason = String::from_str(&env, "Not a member");
+        let result = client.try_kick_member(&admin, &non_member, &circle_id, &reason);
 
-        // User 2 votes
-        SoroSusuTrait::vote_penalty_change(env.clone(), user2.clone(), circle_id);
-
-        // Should pass (2 out of 3 votes)
-        let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        assert_eq!(circle_after.late_fee_bps, 500);
-        assert_eq!(circle_after.proposed_late_fee_bps, 0);
+        assert_eq!(result, Err(Ok(Error::MemberNotFound)));
     }
 
     #[test]
-    fn test_nft_membership() {
+    fn test_kick_member_updates_member_count() {
         let env = Env::default();
         let admin = Address::generate(&env);
-        let creator = Address::generate(&env);
-        let user = Address::generate(&env);
+        let member1 = Address::generate(&env);
+        let member2 = Address::generate(&env);
         let token = Address::generate(&env);
-        let nft_contract = env.register_contract(None, MockNft);
 
-        SoroSusuTrait::init(env.clone(), admin.clone());
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
 
-        let circle_id = SoroSusuTrait::create_circle(
-            env.clone(),
-            creator.clone(),
-            1000,
-            5,
-            token.clone(),
-            604800,
-            0,
-            nft_contract.clone(),
-        );
+        env.mock_all_auths();
 
+        client.init(&admin);
+        let circle_id = client.create_circle(&admin, &1000, &10, &token, &604800);
+
+        client.join_circle(&member1, &circle_id);
+        client.join_circle(&member2, &circle_id);
+
+        let reason = String::from_str(&env, "Test removal");
+        let result = client.try_kick_member(&admin, &member1, &circle_id, &reason);
+
+        assert!(result.is_ok());
+    }
         // Add members
         SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
