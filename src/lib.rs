@@ -4,6 +4,7 @@ use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address,
 // --- DATA STRUCTURES ---
 const YIELD_LIQUIDITY_BUFFER_SECS: u64 = 60 * 60;
 const DURATION_CHANGE_NOTICE_SECS: u64 = 72 * 60 * 60;
+const REFERRAL_DISCOUNT_BPS: u32 = 500; // 5%
 
 #[contracttype]
 #[derive(Clone)]
@@ -42,6 +43,9 @@ pub struct Member {
     pub last_contribution_time: u64,
     pub is_active: bool,
     pub tier_multiplier: u32, // Multiplier for tiered contributions (e.g., 1=Bronze, 2=Silver, 3=Gold)
+    pub status: MemberStatus,
+    pub total_contributed: u64,
+    pub referrer: Option<Address>,
 }
 
 #[contracttype]
@@ -112,6 +116,7 @@ pub trait SoroSusuTrait {
 
     // Join an existing circle
     fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32);
+    fn join_circle_with_referrer(env: Env, user: Address, circle_id: u64, tier_multiplier: u32, referrer: Option<Address>);
 
     // Make a deposit (Pay your weekly/monthly due)
     fn deposit(env: Env, user: Address, circle_id: u64);
@@ -206,6 +211,36 @@ fn get_member_address_by_index(env: &Env, circle_id: u64, index: u16) -> Address
     }
     
     circle.member_addresses.get(index as u32).unwrap().clone()
+}
+
+fn has_successful_referral(env: &Env, circle: &CircleInfo, candidate_referrer: &Address) -> bool {
+    let member_count = circle.member_count as u32;
+    for i in 0..member_count {
+        let member_address = circle.member_addresses.get(i).unwrap();
+        let member_key = DataKey::Member(member_address);
+        let referred_member: Member = match env.storage().instance().get(&member_key) {
+            Some(member) => member,
+            None => continue,
+        };
+
+        if referred_member.referrer == Some(candidate_referrer.clone()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn apply_referral_discount(env: &Env, circle: &CircleInfo, member: &Member, penalty_amount: u64) -> u64 {
+    if penalty_amount == 0 {
+        return 0;
+    }
+
+    if has_successful_referral(env, circle, &member.address) {
+        let discount = (penalty_amount * REFERRAL_DISCOUNT_BPS as u64) / 10000;
+        penalty_amount.saturating_sub(discount)
+    } else {
+        penalty_amount
+    }
 }
 
 // Execute finalize round operation
@@ -404,6 +439,10 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32) {
+        Self::join_circle_with_referrer(env, user, circle_id, tier_multiplier, None);
+    }
+
+    fn join_circle_with_referrer(env: Env, user: Address, circle_id: u64, tier_multiplier: u32, referrer: Option<Address>) {
         // 1. Authorization: The user MUST sign this transaction
         user.require_auth();
 
@@ -426,6 +465,16 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Tier multiplier must be at least 1");
         }
 
+        if let Some(referrer_address) = referrer.clone() {
+            if referrer_address == user {
+                panic!("Referrer cannot be the same as user");
+            }
+            let referrer_key = DataKey::Member(referrer_address);
+            if !env.storage().instance().has(&referrer_key) {
+                panic!("Referrer must already be a member");
+            }
+        }
+
         // 6. Create and store the new member
         let new_member = Member {
             address: user.clone(),
@@ -436,6 +485,7 @@ impl SoroSusuTrait for SoroSusu {
             tier_multiplier,
             status: MemberStatus::Active,
             total_contributed: 0,
+            referrer,
         };
         
         // 7. Store the member and update circle count
@@ -495,7 +545,8 @@ impl SoroSusuTrait for SoroSusu {
 
         if current_time > circle.deadline_timestamp {
             // Calculate penalty based on dynamic rate and member's tier
-            penalty_amount = (member_contribution_amount * circle.late_fee_bps as u64) / 10000;
+            let base_penalty = (member_contribution_amount * circle.late_fee_bps as u64) / 10000;
+            penalty_amount = apply_referral_discount(&env, &circle, &member, base_penalty);
             
             // Update Group Reserve balance
             let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
@@ -855,8 +906,11 @@ impl SoroSusuTrait for SoroSusu {
             index: exiting_member.index, // Inherit the position in queue
             contribution_count: 0,
             last_contribution_time: 0,
+            is_active: true,
+            tier_multiplier: 1,
             status: MemberStatus::Active,
             total_contributed: 0,
+            referrer: None,
         };
 
         // Store the new member
@@ -1194,8 +1248,47 @@ mod fuzz_tests {
         let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
         assert!(circle.contribution_bitmap & (1 << member.index) != 0);
         assert_eq!(member.contribution_count, 1);
+    }
 
-        println!("G�� Late penalty mechanism test passed - 1% penalty correctly routed to Group Reserve");
+    #[test]
+    fn test_referrer_gets_late_fee_discount() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let referrer = Address::generate(&env);
+        let referred = Address::generate(&env);
+        let token = Address::generate(&env);
+        let nft_contract = env.register_contract(None, MockNft);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            100_000,
+            5,
+            token.clone(),
+            604800,
+            0,
+            nft_contract.clone(),
+        );
+
+        SoroSusuTrait::join_circle(env.clone(), referrer.clone(), circle_id, 1);
+        SoroSusuTrait::join_circle_with_referrer(
+            env.clone(),
+            referred.clone(),
+            circle_id,
+            1,
+            Some(referrer.clone()),
+        );
+
+        env.mock_all_auths();
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
+
+        SoroSusuTrait::deposit(env.clone(), referrer.clone(), circle_id);
+
+        let reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        assert_eq!(reserve_balance, 950, "Expected 5% referral discount on late fee");
     }
 
     #[test]
@@ -1324,7 +1417,7 @@ mod fuzz_tests {
 
         SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
-        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id, 1);
 
         env.mock_all_auths();
 
@@ -1369,9 +1462,9 @@ mod fuzz_tests {
         // Add members
         SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id, 1);
         SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id, 1);
-        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id, 1);
         // Join should trigger mint (mocked)
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
 
         env.mock_all_auths();
 
@@ -1637,7 +1730,7 @@ mod fuzz_tests {
         SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
         
         // Test multi-sig eject member operation
-        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id, 1);
         env.mock_all_auths();
 
     #[test]
