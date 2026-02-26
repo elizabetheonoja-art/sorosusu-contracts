@@ -8,6 +8,9 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib"] # Essential for WASM compilation
 
+[features]
+testutils = []
+
 [dependencies]
 soroban-sdk = "21.0.0"
 
