@@ -24,11 +24,19 @@ pub enum Error {
     InsufficientInsurance = 12,
     InsuranceAlreadyUsed = 13,
     RateLimitExceeded = 14,
+    InsufficientCollateral = 15,
+    CollateralAlreadyStaked = 16,
+    CollateralNotStaked = 17,
+    CollateralLocked = 18,
+    MemberNotDefaulted = 19,
+    CollateralAlreadyReleased = 20,
 }
 
 // --- CONSTANTS ---
 const REFERRAL_DISCOUNT_BPS: u32 = 500; // 5%
 const RATE_LIMIT_SECONDS: u64 = 300; // 5 minutes
+const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
+const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
 
 // --- DATA STRUCTURES ---
 
@@ -45,6 +53,9 @@ pub enum DataKey {
     LastCreatedTimestamp(Address),
     SafetyDeposit(Address, u64),
     LendingPool,
+    CollateralVault(Address, u64),
+    CollateralConfig(u64),
+    DefaultedMembers(u64),
 }
 
 #[contracttype]
@@ -53,6 +64,27 @@ pub enum MemberStatus {
     Active,
     AwaitingReplacement,
     Ejected,
+    Defaulted,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum CollateralStatus {
+    NotStaked,
+    Staked,
+    Slashed,
+    Released,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CollateralInfo {
+    pub member: Address,
+    pub circle_id: u64,
+    pub amount: i128,
+    pub status: CollateralStatus,
+    pub staked_timestamp: u64,
+    pub release_timestamp: Option<u64>,
 }
 
 #[contracttype]
@@ -89,6 +121,9 @@ pub struct CircleInfo {
     pub nft_contract: Address,
     pub is_round_finalized: bool,
     pub current_pot_recipient: Option<Address>,
+    pub requires_collateral: bool,
+    pub collateral_bps: u32,
+    pub total_cycle_value: i128,
 }
 
 // --- CONTRACT CLIENTS ---
@@ -133,6 +168,12 @@ pub trait SoroSusuTrait {
     
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
+    
+    // Collateral functions
+    fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128);
+    fn slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
+    fn release_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
+    fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address);
 }
 
 // --- IMPLEMENTATION ---
@@ -183,6 +224,11 @@ impl SoroSusuTrait for SoroSusu {
         let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
         circle_count += 1;
 
+        // Calculate total cycle value and determine collateral requirements
+        let total_cycle_value = amount * (max_members as i128);
+        let requires_collateral = total_cycle_value >= HIGH_VALUE_THRESHOLD;
+        let collateral_bps = if requires_collateral { DEFAULT_COLLATERAL_BPS } else { 0 };
+
         let new_circle = CircleInfo {
             id: circle_count,
             creator: creator.clone(),
@@ -202,6 +248,9 @@ impl SoroSusuTrait for SoroSusu {
             nft_contract,
             is_round_finalized: false,
             current_pot_recipient: None,
+            requires_collateral,
+            collateral_bps,
+            total_cycle_value,
         };
 
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
@@ -221,6 +270,21 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         if env.storage().instance().has(&member_key) {
             panic!("Already member");
+        }
+
+        // Check collateral requirement for high-value circles
+        if circle.requires_collateral {
+            let collateral_key = DataKey::CollateralVault(user.clone(), circle_id);
+            let collateral_info: Option<CollateralInfo> = env.storage().instance().get(&collateral_key);
+            
+            match collateral_info {
+                Some(collateral) => {
+                    if collateral.status != CollateralStatus::Staked {
+                        panic!("Collateral not properly staked");
+                    }
+                }
+                None => panic!("Collateral required for this circle"),
+            }
         }
 
         let new_member = Member {
@@ -364,6 +428,27 @@ impl SoroSusuTrait for SoroSusu {
         let token_client = token::Client::new(&env, &circle.token);
         token_client.transfer(&env.current_contract_address(), &user, &pot_amount);
 
+        // Auto-release collateral if member has completed all contributions
+        if circle.requires_collateral {
+            let member_key = DataKey::Member(user.clone());
+            if let Some(member_info) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+                if member_info.contribution_count >= circle.max_members {
+                    let collateral_key = DataKey::CollateralVault(user.clone(), circle_id);
+                    if let Some(mut collateral_info) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
+                        if collateral_info.status == CollateralStatus::Staked {
+                            // Release collateral back to member
+                            token_client.transfer(&env.current_contract_address(), &user, &collateral_info.amount);
+                            
+                            // Update collateral status
+                            collateral_info.status = CollateralStatus::Released;
+                            collateral_info.release_timestamp = Some(env.ledger().timestamp());
+                            env.storage().instance().set(&collateral_key, &collateral_info);
+                        }
+                    }
+                }
+            }
+        }
+
         // Reset for next round
         circle.is_round_finalized = false;
         circle.contribution_bitmap = 0;
@@ -445,5 +530,166 @@ impl SoroSusuTrait for SoroSusu {
         let mut balance: i128 = env.storage().instance().get(&safety_key).unwrap_or(0);
         balance += amount;
         env.storage().instance().set(&safety_key, &balance);
+    }
+
+    fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128) {
+        user.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        if !circle.requires_collateral {
+            panic!("Collateral not required for this circle");
+        }
+
+        let collateral_key = DataKey::CollateralVault(user.clone(), circle_id);
+        
+        // Check if collateral already staked
+        if let Some(_collateral) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
+            panic!("Collateral already staked");
+        }
+
+        // Calculate required collateral amount
+        let required_collateral = (circle.total_cycle_value * circle.collateral_bps as i128) / 10000;
+        
+        if amount < required_collateral {
+            panic!("Insufficient collateral amount");
+        }
+
+        // Transfer collateral to contract
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&user, &env.current_contract_address(), &amount);
+
+        // Create collateral record
+        let collateral_info = CollateralInfo {
+            member: user.clone(),
+            circle_id,
+            amount,
+            status: CollateralStatus::Staked,
+            staked_timestamp: env.ledger().timestamp(),
+            release_timestamp: None,
+        };
+
+        env.storage().instance().set(&collateral_key, &collateral_info);
+    }
+
+    fn slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
+        let mut collateral_info: CollateralInfo = env.storage().instance().get(&collateral_key)
+            .expect("Collateral not staked");
+
+        if collateral_info.status != CollateralStatus::Staked {
+            panic!("Collateral not available for slashing");
+        }
+
+        // Check if member is defaulted
+        let defaulted_key = DataKey::DefaultedMembers(circle_id);
+        let defaulted_members: Vec<Address> = env.storage().instance().get(&defaulted_key).unwrap_or(Vec::new(&env));
+        
+        if !defaulted_members.contains(&member) {
+            panic!("Member not defaulted");
+        }
+
+        // Slash the collateral - distribute to remaining active members
+        let token_client = token::Client::new(&env, &circle.token);
+        let slash_amount = collateral_info.amount;
+        
+        // Get active members (excluding defaulted member)
+        let mut active_members: Vec<Address> = Vec::new(&env);
+        for i in 0..circle.max_members {
+            // This is a simplified approach - in practice, you'd want to store member addresses more efficiently
+            // For now, we'll distribute to group reserve
+        }
+        
+        // Transfer to group reserve for distribution
+        let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        reserve += slash_amount;
+        env.storage().instance().set(&DataKey::GroupReserve, &reserve);
+
+        // Update collateral status
+        collateral_info.status = CollateralStatus::Slashed;
+        env.storage().instance().set(&collateral_key, &collateral_info);
+    }
+
+    fn release_collateral(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        
+        if caller != circle.creator && caller != stored_admin && caller != member {
+            panic!("Unauthorized");
+        }
+
+        let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
+        let mut collateral_info: CollateralInfo = env.storage().instance().get(&collateral_key)
+            .expect("Collateral not staked");
+
+        if collateral_info.status != CollateralStatus::Staked {
+            panic!("Collateral not available for release");
+        }
+
+        // Check if member has completed all contributions
+        let member_key = DataKey::Member(member.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+        
+        if member_info.contribution_count < circle.max_members {
+            panic!("Member has not completed all contributions");
+        }
+
+        // Release collateral back to member
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&env.current_contract_address(), &member, &collateral_info.amount);
+
+        // Update collateral status
+        collateral_info.status = CollateralStatus::Released;
+        collateral_info.release_timestamp = Some(env.ledger().timestamp());
+        env.storage().instance().set(&collateral_key, &collateral_info);
+    }
+
+    fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        
+        if caller != circle.creator && caller != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let member_key = DataKey::Member(member.clone());
+        let mut member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+        
+        if member_info.status == MemberStatus::Defaulted {
+            panic!("Member already defaulted");
+        }
+
+        // Mark member as defaulted
+        member_info.status = MemberStatus::Defaulted;
+        env.storage().instance().set(&member_key, &member_info);
+
+        // Add to defaulted members list
+        let defaulted_key = DataKey::DefaultedMembers(circle_id);
+        let mut defaulted_members: Vec<Address> = env.storage().instance().get(&defaulted_key).unwrap_or(Vec::new(&env));
+        
+        if !defaulted_members.contains(&member) {
+            defaulted_members.push_back(member.clone());
+            env.storage().instance().set(&defaulted_key, &defaulted_members);
+        }
+
+        // Auto-slash collateral if staked
+        let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
+        if let Some(_collateral) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
+            // Reuse slash_collateral logic
+            Self::slash_collateral(env, caller, circle_id, member);
+        }
     }
 }
