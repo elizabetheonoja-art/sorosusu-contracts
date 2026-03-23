@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // --- ERROR CODES ---
@@ -174,6 +174,9 @@ pub trait SoroSusuTrait {
     fn slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
     fn release_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
     fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address);
+
+    // Privacy functions
+    fn get_reputation_hash(env: Env, user: Address) -> BytesN<32>;
 }
 
 // --- IMPLEMENTATION ---
@@ -691,5 +694,26 @@ impl SoroSusuTrait for SoroSusu {
             // Reuse slash_collateral logic
             Self::slash_collateral(env, caller, circle_id, member);
         }
+    }
+
+    fn get_reputation_hash(env: Env, user: Address) -> BytesN<32> {
+        let member_key = DataKey::Member(user.clone());
+        let member_info_opt: Option<Member> = env.storage().instance().get(&member_key);
+        
+        let has_good_reputation = match member_info_opt {
+            Some(member_info) => {
+                member_info.contribution_count > 3 && member_info.status == MemberStatus::Active
+            },
+            None => false,
+        };
+        
+        let mut payload = Bytes::new(&env);
+        if has_good_reputation {
+            payload.push_back(1u32);
+        } else {
+            payload.push_back(0u32);
+        }
+        
+        env.crypto().sha256(&payload)
     }
 }
