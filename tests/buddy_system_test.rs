@@ -41,6 +41,7 @@ fn test_buddy_pairing() {
         &604800,
         &0,
         &nft_contract,
+        &0,
     );
 
     // Both users join the circle
@@ -91,6 +92,7 @@ fn test_buddy_payment_fallback() {
         &604800,
         &0,
         &nft_contract,
+        &0,
     );
 
     // Both users join the circle

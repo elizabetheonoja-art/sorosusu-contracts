@@ -52,6 +52,7 @@ fn test_full_rosca_cycle() {
         &cycle_duration,
         &100, // 1% insurance fee
         &nft_id,
+        &0, // min_reputation
     );
     
     // Join circle
