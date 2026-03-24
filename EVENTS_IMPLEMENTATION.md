@@ -1,5 +1,28 @@
 # SoroSusu Events Implementation
 
+## Audit Event
+
+The contract now emits an `AUDIT` event whenever a sensitive action is successfully completed.
+
+### Event Topics and Data
+
+- **Event Symbol**: `AUDIT`
+- **Topics**: `(AUDIT, actor, resource_id)`
+- **Data**: `(audit_id, timestamp)`
+
+### Backing Storage
+
+Each emitted event corresponds to an immutable on-chain `AuditEntry` stored in contract storage. Consumers can use events for streaming/indexing and use query methods for direct on-chain reads.
+
+### Sensitive Actions Covered
+
+- Penalty proposal creation
+- Penalty voting
+- Social recovery proposal creation
+- Social recovery voting
+- Social recovery execution
+- Admin-sensitive operations
+
 ## Issue #25: Events - Emit CycleCompleted and GroupRollover
 
 **Acceptance Criteria Met:**

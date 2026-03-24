@@ -1,6 +1,4 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::Address as _, Address, Env, token, contract, contractimpl};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient};
 
 #[contract]
 pub struct MockNft;
@@ -9,6 +7,11 @@ pub struct MockNft;
 impl MockNft {
     pub fn mint(_env: Env, _to: Address, _id: u128) {}
     pub fn burn(_env: Env, _from: Address, _id: u128) {}
+}
+
+#[allow(deprecated)]
+fn register_token(env: &Env, admin: &Address) -> Address {
+    env.register_stellar_asset_contract(admin.clone())
 }
 
 #[test]
@@ -30,7 +33,7 @@ fn test_full_rosca_cycle() {
     
     // Deploy mock token
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+
     let token_client = token::StellarAssetClient::new(&env, &token_id);
     let token_token_client = token::Client::new(&env, &token_id);
     
@@ -68,9 +71,29 @@ fn test_full_rosca_cycle() {
     assert_eq!(token_token_client.balance(&user1), 10000 - 1000 - 10); // 1000 + 1% fee
     assert_eq!(token_token_client.balance(&user2), 10000 - 1000 - 10);
     
-    // Finalize round (Simplified in this version)
-    // In our actual implementation, finalize_round was incomplete, let's fix it if needed.
-    // For this test, let's assume it sets the recipient.
-    
-    println!("✅ Pipeline test completed successfully");
+    client.finalize_round(&creator, &circle_id);
+
+    env.as_contract(&contract_id, || {
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+        let scheduled_time: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ScheduledPayoutTime(circle_id))
+            .unwrap();
+        assert!(circle.is_round_finalized);
+        assert_eq!(circle.current_pot_recipient, Some(user1.clone()));
+        assert_eq!(scheduled_time, env.ledger().timestamp() + 86400);
+    });
+
+    let audit_entries = client.query_audit_by_resource(&circle_id, &0, &u64::MAX, &0, &10);
+    assert!(audit_entries.len() >= 1);
+
+    let finalize_audit = audit_entries.get(audit_entries.len() - 1).unwrap();
+    assert_eq!(finalize_audit.actor, creator);
+    assert_eq!(finalize_audit.action, AuditAction::AdminAction);
+    assert_eq!(finalize_audit.resource_id, circle_id);
 }

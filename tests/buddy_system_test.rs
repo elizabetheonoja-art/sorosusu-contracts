@@ -1,5 +1,4 @@
-use soroban_sdk::{Env, Address, testutils::Address as _, contract, contractimpl, token};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient};
+
 
 #[contract]
 pub struct MockNft;
@@ -8,6 +7,11 @@ pub struct MockNft;
 impl MockNft {
     pub fn mint(_env: Env, _to: Address, _id: u128) {}
     pub fn burn(_env: Env, _from: Address, _id: u128) {}
+}
+
+#[allow(deprecated)]
+fn register_token(env: &Env, admin: &Address) -> Address {
+    env.register_stellar_asset_contract(admin.clone())
 }
 
 #[test]
@@ -22,7 +26,6 @@ fn test_buddy_pairing() {
     
     // Register mock token
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     
     let nft_contract = env.register_contract(None, MockNft);
 
@@ -54,9 +57,9 @@ fn test_buddy_pairing() {
 
     // User2 sets safety deposit
     // Need to mint tokens to user2 first
-    let token_client = token::StellarAssetClient::new(&env, &token);
-    token_client.mint(&user2, &5000);
-    
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&user2, &5000);
+
     client.set_safety_deposit(&user2, &circle_id, &2000);
 
     println!("✅ Buddy system pairing and safety deposit test passed");
@@ -74,7 +77,7 @@ fn test_buddy_payment_fallback() {
     
     // Register mock token
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+
     
     let nft_contract = env.register_contract(None, MockNft);
 
@@ -105,10 +108,22 @@ fn test_buddy_payment_fallback() {
     client.pair_with_member(&user1, &user2);
 
     // User2 sets safety deposit (enough to cover user1's payment)
-    let token_client = token::StellarAssetClient::new(&env, &token);
-    token_client.mint(&user2, &5000);
-    
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    let token_client = token::Client::new(&env, &token);
+    token_admin_client.mint(&user2, &5000);
+
     client.set_safety_deposit(&user2, &circle_id, &2000);
 
-    println!("✅ Buddy payment fallback test structure created");
+    client.deposit(&user1, &circle_id);
+
+    env.as_contract(&contract_id, || {
+        let remaining_deposit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SafetyDeposit(user2.clone(), circle_id))
+            .unwrap();
+        assert_eq!(remaining_deposit, 1000);
+    });
+
+    assert_eq!(token_client.balance(&user2), 3000);
 }

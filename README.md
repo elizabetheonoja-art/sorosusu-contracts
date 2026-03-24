@@ -11,6 +11,38 @@ A trustless Rotating Savings and Credit Association (ROSCA) built on Stellar Sor
 - Join existing circles
 - Deposit USDC/XLM securely
 - Automated payouts (Coming Soon)
+- Immutable audit log for sensitive actions
+
+## Audit Log
+
+Sensitive actions now write immutable on-chain audit entries with:
+- actor
+- action
+- timestamp
+- resource_id
+
+Current action coverage in this contract:
+- Governance proposal creation
+- Governance voting
+- Social recovery proposal creation
+- Social recovery voting and execution
+- Admin actions such as member ejection, insurance coverage, lending pool changes, and round finalization
+
+Audit entries are stored in append-only contract storage and emitted as AUDIT events. The contract also maintains secondary indexes for querying by actor and resource.
+
+### Query Methods
+
+- `get_audit_entry(id)`
+- `query_audit_by_actor(actor, start_time, end_time, offset, limit)`
+- `query_audit_by_resource(resource_id, start_time, end_time, offset, limit)`
+- `query_audit_by_time(start_time, end_time, offset, limit)`
+
+### Query Semantics
+
+- Time bounds are inclusive
+- Results are returned in insertion order
+- Queries are paginated with `offset` and `limit`
+- Maximum page size is capped in-contract to avoid oversized responses
 
 ## Protocol fee (monetization)
 
