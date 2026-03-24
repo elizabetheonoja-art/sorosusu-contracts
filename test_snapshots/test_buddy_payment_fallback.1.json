@@ -56,6 +56,9 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -567,6 +570,14 @@
                           "map": [
                             {
                               "key": {
+                                "symbol": "collateral_bps"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "contribution_amount"
                               },
                               "val": {
@@ -699,6 +710,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "min_reputation"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "nft_contract"
                               },
                               "val": {
@@ -707,10 +726,29 @@
                             },
                             {
                               "key": {
+                                "symbol": "requires_collateral"
+                              },
+                              "val": {
+                                "bool": false
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "token"
                               },
                               "val": {
                                 "address": "CACMVW2KK4H5FZDFF2AUCAKQTEJMZZWJUIZF23XMRVYQBSXYLHZ6BKWN"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_cycle_value"
+                              },
+                              "val": {
+                                "i128": {
+                                  "hi": 0,
+                                  "lo": 5000
+                                }
                               }
                             }
                           ]
@@ -798,6 +836,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "on_time_count"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "referrer"
                               },
                               "val": "void"
@@ -878,6 +924,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "on_time_count"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "referrer"
                               },
                               "val": "void"
@@ -903,6 +957,42 @@
                               }
                             }
                           ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "MemberAtIndex"
+                            },
+                            {
+                              "u64": 1
+                            },
+                            {
+                              "u32": 0
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "MemberAtIndex"
+                            },
+                            {
+                              "u64": 1
+                            },
+                            {
+                              "u32": 1
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                         }
                       },
                       {
@@ -1428,6 +1518,9 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
