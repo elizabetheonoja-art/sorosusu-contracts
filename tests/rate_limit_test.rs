@@ -35,6 +35,7 @@ fn test_rate_limit_exact_boundary() {
 #[test]
 fn test_rate_limit_multiple_users() {
     // Different users should have independent rate limits
+
     const RATE_LIMIT_SECONDS: u64 = 300;
     
     // User 1: First creation at 1000
