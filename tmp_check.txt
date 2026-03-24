@@ -1,0 +1,37 @@
+﻿cargo :     Checking 
+sorosusu-contracts v0.1.0 (C:\
+Users\USER\sorosusu-contracts)
+At line:1 char:1
++ cargo check 2>&1 | Out-File 
+-FilePath tmp_check.txt 
+-Encoding utf8; G ...
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : 
+    NotSpecified: (    Check  
+  ing so...susu-contracts):   
+ String) [], RemoteExcepti    
+on
+    + FullyQualifiedErrorId : 
+    NativeCommandError
+ 
+warning: constant 
+`LENIENCY_GRACE_PERIOD` is 
+never used
+  --> src\lib.rs:53:7
+   |
+53 | const 
+LENIENCY_GRACE_PERIOD: u64 = 
+172800; // 48 hours in seconds
+   |       
+^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: 
+`#[warn(dead_code)]` (part of 
+`#[warn(unused)]`) on by 
+default
+
+warning: `sorosusu-contracts` 
+(lib) generated 1 warning
+    Finished `dev` profile 
+[unoptimized + debuginfo] 
+target(s) in 1.26s
