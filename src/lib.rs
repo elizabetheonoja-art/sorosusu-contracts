@@ -52,6 +52,7 @@ pub enum DataKey {
     Dispute(u64, Address),
     ProtocolFeeBps,
     ProtocolTreasury,
+    UserStats(Address),
 }
 
 #[contracttype]
@@ -62,6 +63,14 @@ pub struct Dispute {
     pub amount: i128,
     pub reason_hash: u64,
     pub is_open: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserStats {
+    pub total_volume_saved: i128,
+    pub on_time_contributions: u32,
+    pub late_contributions: u32,
 }
 
 #[contracttype]
@@ -163,6 +172,11 @@ pub trait SoroSusuTrait {
     fn vote_arbitrator(env: Env, user: Address, circle_id: u64);
 
     fn transfer_membership(env: Env, old_user: Address, new_user: Address, circle_id: u64);
+
+    fn slash_user_credit(env: Env, admin: Address, user: Address, late_penalty_count: u32);
+
+    fn get_user_reliability_score(env: Env, user: Address) -> u32;
+    fn get_user_stats(env: Env, user: Address) -> UserStats;
 }
 
 // --- IMPLEMENTATION ---
@@ -307,6 +321,13 @@ impl SoroSusuTrait for SoroSusu {
         let base_amount = circle.contribution_amount * member.tier_multiplier as i128;
         let mut penalty_amount = 0i128;
 
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let mut user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+
         if current_time > circle.deadline_timestamp {
             let base_penalty = (base_amount * circle.late_fee_bps as i128) / 10000;
             // Apply referral discount
@@ -322,7 +343,19 @@ impl SoroSusuTrait for SoroSusu {
             let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
             reserve += penalty_amount;
             env.storage().instance().set(&DataKey::GroupReserve, &reserve);
+            
+            user_stats.late_contributions += 1;
+        } else {
+            user_stats.on_time_contributions += 1;
         }
+
+        user_stats.total_volume_saved += base_amount;
+        env.storage().instance().set(&user_stats_key, &user_stats);
+
+        env.events().publish(
+            (Symbol::new(&env, "USER_STATS"), user.clone()),
+            (user_stats.on_time_contributions, user_stats.late_contributions, user_stats.total_volume_saved)
+        );
 
         let insurance_fee = (base_amount * circle.insurance_fee_bps as i128) / 10000;
         let total_amount = base_amount + insurance_fee + penalty_amount;
@@ -471,6 +504,21 @@ impl SoroSusuTrait for SoroSusu {
         circle.insurance_balance -= amount_needed;
         circle.is_insurance_used = true;
 
+        // The member defaulted and needed an insurance bailout, increment late count
+        let user_stats_key = DataKey::UserStats(member.clone());
+        let mut user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+        user_stats.late_contributions += 1;
+        env.storage().instance().set(&user_stats_key, &user_stats);
+
+        env.events().publish(
+            (Symbol::new(&env, "USER_STATS"), member.clone()),
+            (user_stats.on_time_contributions, user_stats.late_contributions, user_stats.total_volume_saved)
+        );
+
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
@@ -574,6 +622,20 @@ impl SoroSusuTrait for SoroSusu {
             // Funds stay in the contract, credit to circle's insurance
             circle.insurance_balance += dispute.amount;
             env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+            
+            // Penalize the user for a bad faith dispute
+            let user_stats_key = DataKey::UserStats(user.clone());
+            let mut stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+                total_volume_saved: 0,
+                on_time_contributions: 0,
+                late_contributions: 0,
+            });
+            stats.late_contributions += 3; // Equivalent to 3 late payments
+            env.storage().instance().set(&user_stats_key, &stats);
+            env.events().publish(
+                (Symbol::new(&env, "USER_STATS"), user.clone()),
+                (stats.on_time_contributions, stats.late_contributions, stats.total_volume_saved)
+            );
         }
         
         env.events().publish(
@@ -678,6 +740,65 @@ impl SoroSusuTrait for SoroSusu {
         nft_client.burn(&old_user, &token_id);
         nft_client.mint(&new_user, &token_id);
     }
+
+    fn slash_user_credit(env: Env, admin: Address, user: Address, late_penalty_count: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let mut stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+        stats.late_contributions += late_penalty_count;
+        env.storage().instance().set(&user_stats_key, &stats);
+        env.events().publish(
+            (Symbol::new(&env, "USER_STATS"), user.clone()),
+            (stats.on_time_contributions, stats.late_contributions, stats.total_volume_saved)
+        );
+    }
+
+    fn get_user_reliability_score(env: Env, user: Address) -> u32 {
+        let stats: UserStats = env.storage().instance().get(&DataKey::UserStats(user)).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+
+        let total_contributions = stats.on_time_contributions + stats.late_contributions;
+        if total_contributions == 0 {
+            return 0; // Unscored
+        }
+
+        // 1. Reliability (Max 700 points, weights heavily on successful completion rate)
+        let reliability = (stats.on_time_contributions * 700) / total_contributions;
+
+        // 2. Experience (Max 200 points, 20 points per successful contribution)
+        let experience = (stats.on_time_contributions * 20).min(200);
+
+        // 3. Volume Score (Max 100 points, linearly scales based on the order of magnitude)
+        let mut vol = if stats.total_volume_saved > 0 { stats.total_volume_saved } else { 0 };
+        let mut order = 0;
+        while vol > 0 {
+            vol /= 10;
+            order += 1;
+        }
+        let volume_score = (order * 5).min(100) as u32;
+
+        reliability + experience + volume_score
+    }
+
+    fn get_user_stats(env: Env, user: Address) -> UserStats {
+        env.storage().instance().get(&DataKey::UserStats(user)).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -698,6 +819,16 @@ mod tests {
     #[contractimpl]
     impl MockToken {
         pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    }
+
+    #[contract]
+    pub struct MockLending;
+    #[contractimpl]
+    impl MockLending {
+        pub fn can_borrow(env: Env, oracle: Address, user: Address) -> bool {
+            let client = SoroSusuClient::new(&env, &oracle);
+            client.get_user_reliability_score(&user) >= 500
+        }
     }
 
     #[test]
@@ -850,5 +981,108 @@ mod tests {
         
         // The new user should now be able to act on behalf of the old position 
         client.deposit(&new_user, &circle_id);
+    }
+
+    #[test]
+    fn test_credit_score_oracle() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Start out unscored
+        assert_eq!(client.get_user_reliability_score(&user), 0);
+
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&user, &circle_id, &1, &None);
+        client.deposit(&user, &circle_id);
+
+        // Should earn positive reliability
+        let score = client.get_user_reliability_score(&user);
+        assert!(score > 0);
+        
+        let stats = client.get_user_stats(&user);
+        assert_eq!(stats.on_time_contributions, 1);
+        assert_eq!(stats.late_contributions, 0);
+        assert_eq!(stats.total_volume_saved, 1_000_000_000_000);
+    }
+
+    #[test]
+    fn test_slash_user_credit() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        client.slash_user_credit(&admin, &user, &5);
+        let stats = client.get_user_stats(&user);
+        assert_eq!(stats.late_contributions, 5);
+        assert_eq!(client.get_user_reliability_score(&user), 0);
+    }
+
+    #[test]
+    fn test_cross_contract_oracle() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let oracle_id = env.register_contract(None, SoroSusu);
+        let oracle_client = SoroSusuClient::new(&env, &oracle_id);
+        
+        let lending_id = env.register_contract(None, MockLending);
+        let lending_client = MockLendingClient::new(&env, &lending_id);
+        
+        env.mock_all_auths();
+        oracle_client.init(&admin);
+        
+        // Start out unscored, cannot borrow
+        assert_eq!(lending_client.can_borrow(&oracle_id, &user), false);
+
+        let circle_id = oracle_client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        oracle_client.join_circle(&user, &circle_id, &1, &None);
+        oracle_client.deposit(&user, &circle_id);
+
+        // After a successful on-time deposit, score surges past the 500 threshold
+        assert_eq!(lending_client.can_borrow(&oracle_id, &user), true);
     }
 }
