@@ -61,7 +61,6 @@ pub enum DataKey {
     GroupReserve,
     LendingPool,
 
-}
 
 #[contracttype]
 #[derive(Clone)]
@@ -1299,6 +1298,7 @@ impl SoroSusuTrait for SoroSusu {
         if caller != circle.creator {
             panic!("Unauthorized");
         }
+
 
 
         member_info.status = MemberStatus::Ejected;
