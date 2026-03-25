@@ -60,6 +60,14 @@ const YIELD_DISTRIBUTION_RECIPIENT_BPS: u32 = 5000; // 50% to current round winn
 const YIELD_DISTRIBUTION_TREASURY_BPS: u32 = 5000; // 50% to group treasury
 const YIELD_COMPOUNDING_FREQUENCY: u64 = 604800; // Weekly compounding (7 days)
 
+// Path Payment Constants
+const PATH_PAYMENT_VOTING_PERIOD: u64 = 43200; // 12 hours for path payment voting
+const PATH_PAYMENT_QUORUM: u32 = 50; // 50% quorum for path payment approval
+const PATH_PAYMENT_MAJORITY: u32 = 66; // 66% majority for path payment approval
+const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
+const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
+const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
+
 // --- DATA STRUCTURES ---
 
 #[contracttype]
@@ -99,6 +107,10 @@ pub enum DataKey {
     YieldVote(u64, Address),
     YieldPoolRegistry,
     GroupTreasury(u64),
+    PathPayment(u64),
+    PathPaymentVote(u64, Address),
+    DexRegistry,
+    SupportedTokens,
 }
 
 #[contracttype]
@@ -362,6 +374,78 @@ pub struct YieldDistribution {
     pub total_yield: i128,
     pub distribution_time: u64,
     pub round_number: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathPaymentStatus {
+    Proposed,
+    Approved,
+    Executing,
+    Completed,
+    Failed,
+    Refunded,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathPaymentVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PathPayment {
+    pub circle_id: u64,
+    pub source_token: Address, // Token user sends (e.g., XLM)
+    pub target_token: Address, // Token circle requires (e.g., USDC)
+    pub source_amount: i128,
+    pub target_amount: i128, // Amount after swap
+    pub exchange_rate: i128, // Rate used (target_amount / source_amount * 1M)
+    pub slippage_bps: u32, // Actual slippage experienced
+    pub dex_address: Address, // DEX used for swap
+    pub path_payment: Address, // Stellar path payment used
+    pub created_timestamp: u64,
+    pub status: PathPaymentStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub execution_timestamp: Option<u64>,
+    pub completion_timestamp: Option<u64>,
+    pub refund_amount: Option<i128>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PathPaymentVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: PathPaymentVoteChoice,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SupportedToken {
+    pub token_address: Address,
+    pub token_symbol: String, // e.g., "XLM", "USDC", "USDT"
+    pub decimals: u32,
+    pub is_stable: bool,
+    pub is_active: bool,
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DexInfo {
+    pub dex_address: Address,
+    pub dex_name: String,
+    pub supported_pairs: Vec<(Address, Address)>, // (source, target) pairs
+    pub is_trusted: bool,
+    pub is_active: bool,
+    pub last_updated: u64,
 }
 
 #[contracttype]
@@ -638,6 +722,14 @@ pub trait SoroSusuTrait {
     fn withdraw_yield_delegation(env: Env, circle_id: u64);
     fn distribute_yield_earnings(env: Env, circle_id: u64);
 
+    // Path Payment Contribution Support
+    fn propose_path_payment_support(env: Env, user: Address, circle_id: u64);
+    fn vote_path_payment_support(env: Env, user: Address, circle_id: u64, vote_choice: PathPaymentVoteChoice);
+    fn approve_path_payment_support(env: Env, circle_id: u64);
+    fn execute_path_payment(env: Env, user: Address, circle_id: u64, source_token: Address, source_amount: i128);
+    fn register_supported_token(env: Env, user: Address, token_address: Address, token_symbol: String, decimals: u32, is_stable: bool);
+    fn register_dex(env: Env, user: Address, dex_address: Address, dex_name: String, is_trusted: bool);
+
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
 }
@@ -708,6 +800,44 @@ fn get_member_address_by_index(circle: &CircleInfo, index: u32) -> Address {
         panic!("Member index out of bounds");
     }
     circle.member_addresses.get(index).unwrap()
+}
+
+fn execute_stellar_path_payment(env: &Env, source_token: &Address, target_token: &Address, source_amount: i128, max_slippage_bps: u32) -> (i128, i128, u32) {
+    // This is a simplified implementation - in production would call actual Stellar Path Payment
+    // For now, we'll simulate the swap with a basic exchange rate
+    
+    // Get token info for decimals
+    let source_token_key = DataKey::SupportedTokens(source_token.clone());
+    let source_token_info: SupportedToken = env.storage().instance().get(&source_token_key)
+        .expect("Source token not supported");
+    
+    let target_token_key = DataKey::SupportedTokens(target_token.clone());
+    let target_token_info: SupportedToken = env.storage().instance().get(&target_token_key)
+        .expect("Target token not supported");
+
+    // Calculate exchange rate (simplified - would use actual DEX rates)
+    // Assume 1:1 rate for demonstration, adjust based on token types
+    let rate_adjustment = if source_token_info.is_stable && !target_token_info.is_stable {
+        10000 // Stable to volatile might need premium
+    } else if !source_token_info.is_stable && target_token_info.is_stable {
+        9800 // Stable to stable might have small discount
+    } else {
+        10000 // Default 1:1 rate
+    };
+
+    let exchange_rate = rate_adjustment;
+    let target_amount = (source_amount * exchange_rate) / 10000;
+    
+    // Calculate slippage (0 for this simplified implementation)
+    let slippage_bps = 0;
+    
+    // In real implementation, this would:
+    // 1. Call Stellar Path Payment contract
+    // 2. Handle slippage protection
+    // 3. Handle partial fills
+    // 4. Handle failed transactions
+    
+    (target_amount, exchange_rate, slippage_bps)
 }
 
 fn count_active_members(env: &Env, circle: &CircleInfo) -> u32 {
@@ -2201,6 +2331,341 @@ impl SoroSusuTrait for SoroSusu {
 
         write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
     }
+
+    fn propose_path_payment_support(env: Env, user: Address, circle_id: u64) {
+        user.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if there's already an active path payment proposal
+        let path_payment_key = DataKey::PathPayment(circle_id);
+        if let Some(existing_payment) = env.storage().instance().get::<DataKey, PathPayment>(&path_payment_key) {
+            if existing_payment.status == PathPaymentStatus::Proposed || 
+               existing_payment.status == PathPaymentStatus::Executing ||
+               existing_payment.status == PathPaymentStatus::Completed {
+                panic!("Path payment already active");
+            }
+        }
+
+        let current_time = env.ledger().timestamp();
+        
+        let path_payment = PathPayment {
+            circle_id,
+            source_token: Address::generate(&env), // Will be set during execution
+            target_token: circle.token.clone(),
+            source_amount: 0, // Will be set during execution
+            target_amount: 0, // Will be calculated during execution
+            exchange_rate: 0,
+            slippage_bps: 0,
+            dex_address: Address::generate(&env), // Will be set during execution
+            path_payment: Address::generate(&env), // Will be set during execution
+            created_timestamp: current_time,
+            status: PathPaymentStatus::Proposed,
+            voting_deadline: current_time + PATH_PAYMENT_VOTING_PERIOD,
+            for_votes: 0,
+            against_votes: 0,
+            total_votes_cast: 0,
+            execution_timestamp: None,
+            completion_timestamp: None,
+            refund_amount: None,
+        };
+
+        env.storage().instance().set(&path_payment_key, &path_payment);
+        
+        // The proposer automatically votes for
+        let vote_key = DataKey::PathPaymentVote(circle_id, user.clone());
+        let vote = PathPaymentVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: PathPaymentVoteChoice::For,
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        let mut updated_payment = path_payment;
+        updated_payment.for_votes = 1;
+        updated_payment.total_votes_cast = 1;
+        env.storage().instance().set(&path_payment_key, &updated_payment);
+
+        write_audit(&env, &user, AuditAction::DisputeSubmission, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "PATH_PAYMENT_PROPOSED"), circle_id, user.clone()),
+            (circle.token.clone(), updated_payment.voting_deadline),
+        );
+    }
+
+    fn vote_path_payment_support(env: Env, user: Address, circle_id: u64, vote_choice: PathPaymentVoteChoice) {
+        user.require_auth();
+
+        let payment_key = DataKey::PathPayment(circle_id);
+        let mut payment: PathPayment = env.storage().instance().get(&payment_key)
+            .expect("No active path payment proposal");
+
+        if payment.status != PathPaymentStatus::Proposed {
+            panic!("Path payment is not in voting period");
+        }
+
+        if env.ledger().timestamp() > payment.voting_deadline {
+            payment.status = PathPaymentStatus::Failed;
+            env.storage().instance().set(&payment_key, &payment);
+            panic!("Voting period has expired");
+        }
+
+        // Check if user is an active member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::PathPaymentVote(circle_id, user.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted");
+        }
+
+        // Record the vote
+        let vote = PathPaymentVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: vote_choice.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        match vote_choice {
+            PathPaymentVoteChoice::For => payment.for_votes += 1,
+            PathPaymentVoteChoice::Against => payment.against_votes += 1,
+        }
+        payment.total_votes_cast += 1;
+
+        // Check if voting criteria are met
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let active_members = count_active_members(&env, &circle);
+        
+        let quorum_met = (payment.total_votes_cast * 100) >= (active_members * PATH_PAYMENT_QUORUM);
+        
+        if quorum_met && payment.total_votes_cast > 0 {
+            let approval_percentage = (payment.for_votes * 100) / payment.total_votes_cast;
+            if approval_percentage >= PATH_PAYMENT_MAJORITY {
+                payment.status = PathPaymentStatus::Approved;
+            }
+        }
+
+        env.storage().instance().set(&payment_key, &payment);
+        write_audit(&env, &user, AuditAction::GovernanceVote, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "PATH_PAYMENT_VOTE"), circle_id, user.clone()),
+            (vote_choice, payment.for_votes, payment.against_votes),
+        );
+    }
+
+    fn approve_path_payment_support(env: Env, circle_id: u64) {
+        let payment_key = DataKey::PathPayment(circle_id);
+        let mut payment: PathPayment = env.storage().instance().get(&payment_key)
+            .expect("No path payment proposal found");
+
+        if payment.status != PathPaymentStatus::Approved {
+            panic!("Path payment is not approved");
+        }
+
+        payment.status = PathPaymentStatus::Executing;
+        env.storage().instance().set(&payment_key, &payment);
+
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "PATH_PAYMENT_APPROVED"), circle_id),
+            (payment.source_token, payment.target_token),
+        );
+    }
+
+    fn execute_path_payment(env: Env, user: Address, circle_id: u64, source_token: Address, source_amount: i128) {
+        user.require_auth();
+
+        let payment_key = DataKey::PathPayment(circle_id);
+        let mut payment: PathPayment = env.storage().instance().get(&payment_key)
+            .expect("No path payment proposal found");
+
+        if payment.status != PathPaymentStatus::Approved && payment.status != PathPaymentStatus::Executing {
+            panic!("Path payment is not approved for execution");
+        }
+
+        // Validate source token is supported
+        let source_token_key = DataKey::SupportedTokens(source_token.clone());
+        let source_token_info: SupportedToken = env.storage().instance().get(&source_token_key)
+            .expect("Source token not supported");
+
+        if !source_token_info.is_active {
+            panic!("Source token is not active");
+        }
+
+        // Validate minimum amount
+        if source_amount < MIN_PATH_PAYMENT_AMOUNT {
+            panic!("Amount below minimum path payment");
+        }
+
+        // Get target token info (circle's token)
+        let target_token_key = DataKey::SupportedTokens(payment.target_token.clone());
+        let target_token_info: SupportedToken = env.storage().instance().get(&target_token_key)
+            .expect("Target token not supported");
+
+        if !target_token_info.is_active {
+            panic!("Target token is not supported");
+        }
+
+        let current_time = env.ledger().timestamp();
+        
+        // Update payment details
+        payment.source_token = source_token.clone();
+        payment.source_amount = source_amount;
+        payment.execution_timestamp = Some(current_time);
+        payment.status = PathPaymentStatus::Executing;
+
+        // Execute the swap via Stellar Path Payments
+        let (target_amount, exchange_rate, slippage_bps) = execute_stellar_path_payment(
+            &env, 
+            &source_token, 
+            &payment.target_token, 
+            source_amount,
+            MAX_SLIPPAGE_TOLERANCE_BPS
+        );
+
+        // Update payment with execution results
+        payment.target_amount = target_amount;
+        payment.exchange_rate = exchange_rate;
+        payment.slippage_bps = slippage_bps;
+
+        // Deposit target tokens to circle
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let token_client = token::Client::new(&env, &payment.target_token);
+        let transfer_result = token_client.try_transfer(&user, &env.current_contract_address(), &target_amount);
+        
+        let transfer_success = match transfer_result {
+            Ok(inner) => inner.is_ok(),
+            Err(_) => false,
+        };
+
+        if !transfer_success {
+            payment.status = PathPaymentStatus::Failed;
+            payment.refund_amount = Some(source_amount);
+            env.storage().instance().set(&payment_key, &payment);
+            panic!("Token transfer failed");
+        }
+
+        // Update member contribution
+        let member_key = DataKey::Member(user.clone());
+        let mut member: Member = env.storage().instance().get(&member_key)
+            .expect("Member not found");
+
+        let contribution_amount = circle.contribution_amount * member.tier_multiplier as i128;
+        
+        // Update user statistics
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let mut user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+
+        user_stats.total_volume_saved += contribution_amount;
+        user_stats.on_time_contributions += 1;
+        env.storage().instance().set(&user_stats_key, &user_stats);
+
+        // Update member and circle
+        member.contribution_count += 1;
+        member.last_contribution_time = current_time;
+        circle.contribution_bitmap |= 1u64 << member.index;
+
+        env.storage().instance().set(&member_key, &member);
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Mark as completed
+        payment.status = PathPaymentStatus::Completed;
+        payment.completion_timestamp = Some(current_time);
+        env.storage().instance().set(&payment_key, &payment);
+
+        write_audit(&env, &user, AuditAction::AdminAction, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "PATH_PAYMENT_EXECUTED"), circle_id, user.clone()),
+            (source_amount, target_amount, exchange_rate, slippage_bps),
+        );
+    }
+
+    fn register_supported_token(env: Env, user: Address, token_address: Address, token_symbol: String, decimals: u32, is_stable: bool) {
+        user.require_auth();
+
+        let token_key = DataKey::SupportedTokens(token_address.clone());
+        if env.storage().instance().has(&token_key) {
+            panic!("Token already registered");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let supported_token = SupportedToken {
+            token_address: token_address.clone(),
+            token_symbol,
+            decimals,
+            is_stable,
+            is_active: true,
+            last_updated: current_time,
+        };
+
+        env.storage().instance().set(&token_key, &supported_token);
+
+        write_audit(&env, &user, AuditAction::AdminAction, 0);
+
+        env.events().publish(
+            (Symbol::new(&env, "TOKEN_REGISTERED"), token_address),
+            (token_symbol, decimals, is_stable),
+        );
+    }
+
+    fn register_dex(env: Env, user: Address, dex_address: Address, dex_name: String, is_trusted: bool) {
+        user.require_auth();
+
+        let dex_key = DataKey::DexRegistry(dex_address.clone());
+        if env.storage().instance().has(&dex_key) {
+            panic!("DEX already registered");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let dex_info = DexInfo {
+            dex_address: dex_address.clone(),
+            dex_name,
+            supported_pairs: Vec::new(&env),
+            is_trusted,
+            is_active: true,
+            last_updated: current_time,
+        };
+
+        env.storage().instance().set(&dex_key, &dex_info);
+
+        write_audit(&env, &user, AuditAction::AdminAction, 0);
+
+        env.events().publish(
+            (Symbol::new(&env, "DEX_REGISTERED"), dex_address),
+            (dex_name, is_trusted),
+        );
+    }
 }
 
 fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut YieldDelegation) {
@@ -2676,5 +3141,143 @@ fn calculate_yield_from_pool(env: &Env, delegation: &YieldDelegation, time_elaps
         std::panic::catch_unwind(|| {
             client.approve_yield_delegation(&circle_id);
         }).expect_err("Should panic when trying to approve rejected delegation");
+    }
+
+    #[test]
+    fn test_path_payment_support_proposal_and_execution() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Create circle with USDC as target token
+        let usdc_address = Address::generate(&env);
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000, // 1000 tokens
+            &3,
+            &usdc_address, // USDC as target token
+            &86400,
+            &100,
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Register XLM as supported token
+        client.register_supported_token(
+            &creator,
+            &token_contract, // XLM token address
+            &String::from_str(&env, "XLM"),
+            &7,
+            &true
+        );
+        
+        // Register USDC as supported token
+        client.register_supported_token(
+            &creator,
+            &usdc_address, // USDC token address
+            &String::from_str(&env, "USDC"),
+            &6,
+            &true
+        );
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle and propose path payment support
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Propose path payment support (XLM to USDC)
+        client.propose_path_payment_support(&creator, &circle_id);
+        
+        // Vote for path payment support
+        client.vote_path_payment_support(&user1, &circle_id, &PathPaymentVoteChoice::For);
+        
+        // Approve and execute path payment
+        client.approve_path_payment_support(&circle_id);
+        
+        // Execute path payment (user sends XLM, gets USDC in circle)
+        let xlm_address = token_contract;
+        client.execute_path_payment(
+            &user1,
+            &circle_id,
+            &xlm_address,
+            &500_000_000 // 500 XLM
+        );
+    }
+
+    #[test]
+    fn test_path_payment_support_rejection() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let usdc_address = Address::generate(&env);
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000,
+            &2,
+            &usdc_address, // USDC as target token
+            &86400,
+            &100,
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle and propose path payment support
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Propose path payment support
+        client.propose_path_payment_support(&creator, &circle_id);
+        
+        // Second member votes against - should not meet 66% majority
+        client.vote_path_payment_support(&user1, &circle_id, &PathPaymentVoteChoice::Against);
+        
+        // Try to approve should fail since not approved
+        std::panic::catch_unwind(|| {
+            client.approve_path_payment_support(&circle_id);
+        }).expect_err("Should panic when trying to approve rejected path payment");
     }
 }
