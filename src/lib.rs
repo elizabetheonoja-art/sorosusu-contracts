@@ -52,6 +52,9 @@ const ROLLOVER_QUORUM: u32 = 60; // 60% quorum for rollover voting
 const ROLLOVER_MAJORITY: u32 = 66; // 66% supermajority for rollover approval
 const DEFAULT_ROLLOVER_BONUS_BPS: u32 = 5000; // 50% of platform fee refunded as bonus
 
+// Risk Multiplier Constants
+const RISK_MULTIPLIER: u32 = 3; // 3x late fees after pot win (Aggressive Recovery)
+
 // Yield Delegation Constants
 const YIELD_VOTING_PERIOD: u64 = 86400; // 24 hours for yield delegation voting
 const YIELD_QUORUM: u32 = 75; // 75% quorum for yield delegation (higher stakes)
@@ -122,6 +125,7 @@ pub enum DataKey {
     PathPaymentVote(u64, Address),
     DexRegistry,
     SupportedTokens,
+    PotWinner(Address, u64), // Track members who have won the pot in each circle
 }
 
 #[contracttype]
@@ -1290,7 +1294,21 @@ impl SoroSusuTrait for SoroSusu {
 
         // Check if contribution is late
         if current_time > circle.deadline_timestamp {
-            let base_penalty = (base_amount * circle.late_fee_bps as i128) / 10000;
+            let mut base_penalty = (base_amount * circle.late_fee_bps as i128) / 10000;
+            
+            // Apply Risk Multiplier for Aggressive Recovery if member has already won the pot
+            let pot_winner_key = DataKey::PotWinner(user.clone(), circle_id);
+            if env.storage().instance().has(&pot_winner_key) {
+                // Member has won the pot before - apply 3x risk multiplier
+                base_penalty = base_penalty * RISK_MULTIPLIER as i128;
+                
+                // Emit event for aggressive recovery
+                env.events().publish(
+                    (Symbol::new(&env, "AGGRESSIVE_RECOVERY"), circle_id, user.clone()),
+                    (base_penalty, RISK_MULTIPLIER),
+                );
+            }
+            
             // Apply referral discount
             let mut discount = 0i128;
             if let Some(ref_addr) = &member.referrer {
@@ -1482,6 +1500,16 @@ impl SoroSusuTrait for SoroSusu {
         } else {
             token_client.transfer(&env.current_contract_address(), &user, &total_payout);
         }
+
+        // Track that this member has won the pot (for Risk Multiplier application)
+        let pot_winner_key = DataKey::PotWinner(user.clone(), circle_id);
+        env.storage().instance().set(&pot_winner_key, &true);
+        
+        // Emit event for pot win tracking
+        env.events().publish(
+            (Symbol::new(&env, "POT_WINNER_TRACKED"), circle_id, user.clone()),
+            (env.ledger().timestamp(), total_payout),
+        );
 
         // Auto-release collateral if member has completed all contributions
         if circle.requires_collateral {
@@ -3378,5 +3406,298 @@ fn calculate_yield_from_pool(env: &Env, delegation: &YieldDelegation, time_elaps
         std::panic::catch_unwind(|| {
             client.approve_path_payment_support(&circle_id);
         }).expect_err("Should panic when trying to approve rejected path payment");
+    }
+
+    #[test]
+    fn test_risk_multiplier_normal_late_fee_before_pot_win() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens contribution
+            &2,
+            &token_contract.address,
+            &604800, // 1 week cycle
+            &100, // 1% insurance fee
+            &nft_contract.address,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Make initial deposits on time
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        
+        // Simulate time passing beyond deadline
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
+        
+        // User makes late payment BEFORE winning pot - should pay normal 1% fee (10 tokens)
+        let initial_reserve = client.get_group_reserve_balance();
+        client.deposit(&user, &circle_id);
+        let final_reserve = client.get_group_reserve_balance();
+        
+        // Should be normal late fee (1% of 1000 = 10 tokens)
+        assert_eq!(final_reserve - initial_reserve, 10_000_000_000);
+        
+        println!("✓ Normal late fee applied before pot win");
+    }
+
+    #[test]
+    fn test_risk_multiplier_aggressive_recovery_after_pot_win() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens contribution
+            &2,
+            &token_contract.address,
+            &604800, // 1 week cycle
+            &100, // 1% insurance fee
+            &nft_contract.address,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Complete first cycle where user wins the pot
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user, &circle_id); // User wins the pot
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        
+        // Simulate time passing beyond deadline
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
+        
+        // User makes late payment AFTER winning pot - should pay 3x fee (30 tokens)
+        let initial_reserve = client.get_group_reserve_balance();
+        client.deposit(&user, &circle_id);
+        let final_reserve = client.get_group_reserve_balance();
+        
+        // Should be risk multiplier late fee (3x 1% of 1000 = 30 tokens)
+        assert_eq!(final_reserve - initial_reserve, 30_000_000_000);
+        
+        println!("✓ Risk Multiplier (3x) applied after pot win");
+    }
+
+    #[test]
+    fn test_risk_multiplier_with_referral_discount() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let referrer = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens contribution
+            &3,
+            &token_contract.address,
+            &604800, // 1 week cycle
+            &100, // 1% insurance fee
+            &nft_contract.address,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&referrer, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &Some(referrer)); // User with referrer
+        
+        // Complete first cycle where referrer wins the pot
+        client.deposit(&creator, &circle_id);
+        client.deposit(&referrer, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&referrer, &circle_id); // Referrer wins the pot
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        
+        // Simulate time passing beyond deadline
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
+        
+        // Referrer makes late payment AFTER winning pot with referral discount
+        // Base fee: 3x 1% of 1000 = 30 tokens
+        // Referral discount: 5% of 30 = 1.5 tokens
+        // Final fee: 30 - 1.5 = 28.5 tokens
+        let initial_reserve = client.get_group_reserve_balance();
+        client.deposit(&referrer, &circle_id);
+        let final_reserve = client.get_group_reserve_balance();
+        
+        // Should be risk multiplier fee minus referral discount
+        assert_eq!(final_reserve - initial_reserve, 28_500_000_000);
+        
+        println!("✓ Risk Multiplier with referral discount applied correctly");
+    }
+
+    #[test]
+    fn test_pot_winner_tracking_persistence() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &2,
+            &token_contract.address,
+            &604800,
+            &100,
+            &nft_contract.address,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Complete first cycle where user wins pot
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user, &circle_id);
+        
+        // Complete multiple cycles to verify tracking persists
+        for cycle in 2..=5 {
+            client.deposit(&creator, &circle_id);
+            client.deposit(&user, &circle_id);
+            client.finalize_round(&creator, &circle_id);
+            
+            if cycle % 2 == 0 {
+                client.claim_pot(&creator, &circle_id);
+            } else {
+                client.claim_pot(&user, &circle_id);
+            }
+            
+            // Simulate late payment in each cycle
+            env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
+            
+            let initial_reserve = client.get_group_reserve_balance();
+            client.deposit(&creator, &circle_id); // Creator also late
+            let final_reserve = client.get_group_reserve_balance();
+            
+            if cycle > 1 {
+                // Both should pay 3x fee after winning pot
+                assert_eq!(final_reserve - initial_reserve, 30_000_000_000);
+            }
+        }
+        
+        println!("✓ Pot winner tracking persists across multiple cycles");
+    }
+
+    #[test]
+    fn test_aggressive_recovery_event_emission() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &2,
+            &token_contract.address,
+            &604800,
+            &100,
+            &nft_contract.address,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Complete first cycle where user wins pot
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user, &circle_id);
+        
+        // Start second cycle and make late payment
+        client.deposit(&creator, &circle_id);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
+        
+        // Capture events during late payment
+        let events_before = env.events().all();
+        client.deposit(&user, &circle_id);
+        let events_after = env.events().all();
+        
+        // Should have AGGRESSIVE_RECOVERY event
+        let new_events: Vec<_> = events_after.iter()
+            .filter(|event| !events_before.contains(event))
+            .collect();
+        
+        let has_aggressive_recovery = new_events.iter()
+            .any(|event| event.topics[0].to_symbol().to_string().contains("AGGRESSIVE_RECOVERY"));
+        
+        assert!(has_aggressive_recovery, "Should emit AGGRESSIVE_RECOVERY event");
+        
+        println!("✓ Aggressive Recovery event emitted correctly");
     }
 }
