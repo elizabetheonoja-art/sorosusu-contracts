@@ -140,6 +140,15 @@ const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
 const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
 const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
 
+// Asset Swap / Economic Circuit Breaker Constants
+const PRICE_DROP_THRESHOLD_BPS: u32 = 2000; // 20% price drop triggers circuit breaker
+const ASSET_SWAP_VOTING_PERIOD: u64 = 86400; // 24 hours for asset swap voting
+const ASSET_SWAP_QUORUM: u32 = 60; // 60% quorum for asset swap approval
+const ASSET_SWAP_MAJORITY: u32 = 66; // 66% majority for asset swap approval
+const DEFAULT_HARD_ASSET_GOLD_WEIGHT: u32 = 5000; // 50% gold
+const DEFAULT_HARD_ASSET_BTC_WEIGHT: u32 = 3000; // 30% BTC
+const DEFAULT_HARD_ASSET_SILVER_WEIGHT: u32 = 2000; // 20% silver
+
 // --- DATA STRUCTURES ---
 
 #[contracttype]
@@ -187,6 +196,15 @@ pub enum DataKey {
     // Multi-asset basket storage
     BasketConfig(u64),
     BasketAssetContrib(u64, Address, Address),
+    GroupInsuranceFund(u64), // Per-circle insurance fund balance
+    InsurancePremium(u64, Address), // Track premiums paid by each member per circle
+    PriceOracle(Address), // Price data for each asset
+    HardAssetBasket, // Reference hard asset basket
+    AssetSwapProposal(u64), // Per-circle asset swap proposals
+    AssetSwapVote(u64, Address), // Votes on asset swap proposals
+    LateFeeDistribution(u64, u32), // Late fee distribution per circle per round
+    PaymentTiming(u64, u32, Address), // Payment timing per circle, round, and member
+    PaymentOrderCounter(u64, u32), // Counter to track payment order in each round
 }
 
 #[contracttype]
@@ -716,6 +734,98 @@ pub struct CircleInfo {
     pub basket: Option<Vec<AssetWeight>>,
 }
 
+/// Group Insurance Fund - Tracks mutual insurance for default protection
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupInsuranceFund {
+    pub circle_id: u64,
+    pub total_fund_balance: i128,      // Total balance in the insurance fund
+    pub total_premiums_collected: i128, // Total premiums collected from all members
+    pub total_claims_paid: i128,        // Total claims paid out for defaults
+    pub premium_rate_bps: u32,          // Premium rate in basis points (e.g., 50 = 0.5%)
+    pub is_active: bool,                // Whether the fund is active
+    pub cycle_start_time: u64,          // When the current cycle started
+    pub last_claim_time: Option<u64>,   // Timestamp of last claim
+}
+
+/// Insurance Premium Record - Track individual member's premium contributions
+#[contracttype]
+#[derive(Clone)]
+pub struct InsurancePremiumRecord {
+    pub member: Address,
+    pub circle_id: u64,
+    pub total_premium_paid: i128,       // Total premium paid by this member
+    pub premium_payments: Vec<(u64, i128)>, // List of (round, amount) tuples
+    pub claims_made: i128,              // Total claims made by this member
+    pub net_contribution: i128,         // Premiums paid minus claims received
+}
+
+/// Price Oracle Data - Tracks asset prices for economic circuit breaker
+#[contracttype]
+#[derive(Clone)]
+pub struct PriceOracleData {
+    pub asset_address: Address,
+    pub current_price: i128,           // Current price in base currency (e.g., USD cents)
+    pub last_updated: u64,             // Last update timestamp
+    is_stable_asset: bool,             // Whether this is a stable asset
+}
+
+/// Hard Asset Basket - Reference basket of hard assets for stability comparison
+#[contracttype]
+#[derive(Clone)]
+pub struct HardAssetBasket {
+    pub gold_weight_bps: u32,          // Gold allocation in basis points
+    pub btc_weight_bps: u32,           // BTC allocation in basis points  
+    pub silver_weight_bps: u32,        // Silver allocation in basis points
+    pub total_weight_bps: u32,         // Should equal 10000 (100%)
+}
+
+/// Asset Swap Proposal - For voting on swapping treasury assets
+#[contracttype]
+#[derive(Clone)]
+pub struct AssetSwapProposal {
+    pub circle_id: u64,
+    pub proposer: Address,
+    pub current_asset: Address,
+    pub target_asset: Address,
+    pub swap_percentage_bps: u32,      // Percentage of treasury to swap
+    pub price_drop_percentage_bps: u32, // Detected price drop that triggered proposal
+    pub created_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: ProposalStatus,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub executed_timestamp: Option<u64>,
+}
+
+/// Late Fee Distribution Record - Tracks priority distribution of late fees
+#[contracttype]
+#[derive(Clone)]
+pub struct LateFeeDistribution {
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub pot_winner: Address,
+    pub pot_winner_compensation: i128,      // First priority: compensate pot winner
+    pub on_time_payers_bonus: Vec<(Address, i128)>, // Bonus for on-time payers (pro-rated by payment time)
+    pub total_late_fees_collected: i128,
+    pub distribution_timestamp: u64,
+    pub late_payers: Vec<(Address, i128)>,  // List of late payers and their fines
+}
+
+/// Payment Timing Record - Track when each member paid in a round
+#[contracttype]
+#[derive(Clone)]
+pub struct PaymentTimingRecord {
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub payment_timestamp: u64,
+    pub is_on_time: bool,
+    pub payment_order: u32, // Order in which this payment was made (1 = first, 2 = second, etc.)
+}
+
+
 // --- CONTRACT CLIENTS ---
 
 #[contracttype]
@@ -747,11 +857,31 @@ pub struct NftBadgeMetadata {
     pub group_lead_status: bool,  // true if member is the circle creator
 }
 
+/// Master Credential NFT Badge - Enhanced metadata for 12-month cycle completion
+/// This represents a "Stellar-Native Financial Identity" badge of honor
+#[contracttype]
+#[derive(Clone)]
+pub struct MasterCredentialMetadata {
+    pub volume_tier: u32,              // 1=Bronze, 2=Silver, 3=Gold, 4=Platinum
+    pub perfect_attendance: bool,       // true if zero late contributions
+    pub group_lead_status: bool,        // true if member is the circle creator
+    pub total_cycles_completed: u32,    // Total number of full cycles completed
+    pub total_volume_saved: i128,       // Lifetime volume saved across all circles
+    pub reliability_score: u32,         // 0-10000 bps (0-100%)
+    pub social_capital_score: u32,      // 0-10000 bps (0-100%)
+    pub badges_earned: Vec<Symbol>,     // List of achievement badges
+    pub ecosystem_participation: u32,   // Number of different JerryIdoko projects participated in
+    pub mint_timestamp: u64,            // Timestamp when badge was minted
+    pub circle_id: u64,                 // The circle that triggered this badge
+    pub version: u32,                   // Metadata version for future upgrades
+}
+
 #[contractclient(name = "SusuNftClient")]
 pub trait SusuNftTrait {
     fn mint(env: Env, to: Address, token_id: u128);
     fn burn(env: Env, from: Address, token_id: u128);
     fn mint_badge(env: Env, to: Address, token_id: u128, metadata: NftBadgeMetadata);
+    fn mint_master_credential(env: Env, to: Address, token_id: u128, metadata: MasterCredentialMetadata);
 }
 
 #[contractclient(name = "LendingPoolClient")]
@@ -837,7 +967,26 @@ pub trait SoroSusuTrait {
     fn vote_rollover_bonus(env: Env, user: Address, circle_id: u64, vote_choice: RolloverVoteChoice);
     fn apply_rollover_bonus(env: Env, circle_id: u64);
 
-    // Idle Pot Yield Delegation to Stellar Pools
+    // Group Insurance Fund Management
+    fn get_insurance_fund(env: Env, circle_id: u64) -> GroupInsuranceFund;
+    fn get_premium_record(env: Env, member: Address, circle_id: u64) -> InsurancePremiumRecord;
+    fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
+    fn distribute_remaining_insurance_fund(env: Env, circle_id: u64);
+
+    // Price Oracle and Asset Swap (Economic Circuit Breaker)
+    fn update_price_oracle(env: Env, oracle_provider: Address, asset: Address, price: i128);
+    fn get_asset_price(env: Env, asset: Address) -> PriceOracleData;
+    fn propose_asset_swap(env: Env, user: Address, circle_id: u64, target_asset: Address, swap_percentage_bps: u32);
+    fn vote_asset_swap(env: Env, user: Address, circle_id: u64, vote_choice: QuadraticVoteChoice);
+    fn execute_asset_swap(env: Env, circle_id: u64);
+    fn check_price_drop_and_trigger_swap(env: Env, circle_id: u64) -> bool;
+    fn set_hard_asset_basket(env: Env, admin: Address, gold_weight_bps: u32, btc_weight_bps: u32, silver_weight_bps: u32);
+    fn get_hard_asset_basket(env: Env) -> HardAssetBasket;
+
+    // Late Fee Priority Distribution
+    fn get_late_fee_distribution(env: Env, circle_id: u64, round_number: u32) -> LateFeeDistribution;
+    fn get_payment_timing_record(env: Env, circle_id: u64, round_number: u32, member: Address) -> PaymentTimingRecord;
+    fn distribute_late_fees_with_priority(env: Env, circle_id: u64, round_number: u32);
     fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType);
     fn vote_yield_delegation(env: Env, user: Address, circle_id: u64, vote_choice: YieldVoteChoice);
     fn approve_yield_delegation(env: Env, circle_id: u64);
@@ -1353,9 +1502,13 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Already contributed this round");
         }
 
-        // Calculate the total amount needed (contribution + insurance fee)
+        // Calculate the total amount needed (contribution + insurance fee + group insurance premium)
         let insurance_fee = (circle.contribution_amount as i128 * circle.insurance_fee_bps as i128) / 10_000;
-        let total_amount = circle.contribution_amount as i128 + insurance_fee;
+        
+        // Group Insurance Fund premium (0.5% = 50 basis points)
+        let group_insurance_premium = (circle.contribution_amount as i128 * 50i128) / 10_000;
+        
+        let total_amount = circle.contribution_amount as i128 + insurance_fee + group_insurance_premium;
 
         // Transfer the tokens from user to contract
         let token_client = token::Client::new(&env, &circle.token);
@@ -1368,6 +1521,63 @@ impl SoroSusuTrait for SoroSusu {
 
         // Update circle contributions
         circle.contributions.set(user.clone(), true);
+
+        // Update Group Insurance Fund
+        let mut insurance_fund: GroupInsuranceFund = env.storage().instance()
+            .get(&DataKey::GroupInsuranceFund(circle_id))
+            .unwrap_or(GroupInsuranceFund {
+                circle_id,
+                total_fund_balance: 0,
+                total_premiums_collected: 0,
+                total_claims_paid: 0,
+                premium_rate_bps: 50, // 0.5%
+                is_active: true,
+                cycle_start_time: env.ledger().timestamp(),
+                last_claim_time: None,
+            });
+        
+        insurance_fund.total_fund_balance += group_insurance_premium;
+        insurance_fund.total_premiums_collected += group_insurance_premium;
+        env.storage().instance().set(&DataKey::GroupInsuranceFund(circle_id), &insurance_fund);
+
+        // Update individual premium record
+        let mut premium_record: InsurancePremiumRecord = env.storage().instance()
+            .get(&DataKey::InsurancePremium(circle_id, user.clone()))
+            .unwrap_or(InsurancePremiumRecord {
+                member: user.clone(),
+                circle_id,
+                total_premium_paid: 0,
+                premium_payments: Vec::new(&env),
+                claims_made: 0,
+                net_contribution: 0,
+            });
+        
+        premium_record.total_premium_paid += group_insurance_premium;
+        let current_round = circle.current_recipient_index + 1;
+        premium_record.premium_payments.push_back((current_round, group_insurance_premium));
+        premium_record.net_contribution = premium_record.total_premium_paid - premium_record.claims_made;
+        env.storage().instance().set(&DataKey::InsurancePremium(circle_id, user.clone()), &premium_record);
+
+        // Track payment timing for priority distribution
+        let current_time = env.ledger().timestamp();
+        let is_on_time = current_time <= circle.deadline_timestamp;
+        
+        // Get or initialize payment order counter for this round
+        let mut payment_order_counter: u32 = env.storage().instance()
+            .get(&DataKey::PaymentOrderCounter(circle_id, current_round))
+            .unwrap_or(0);
+        payment_order_counter += 1;
+        env.storage().instance().set(&DataKey::PaymentOrderCounter(circle_id, current_round), &payment_order_counter);
+        
+        let payment_timing = PaymentTimingRecord {
+            member: user.clone(),
+            circle_id,
+            round_number: current_round,
+            payment_timestamp: current_time,
+            is_on_time,
+            payment_order: payment_order_counter,
+        };
+        env.storage().instance().set(&DataKey::PaymentTiming(circle_id, current_round, user.clone()), &payment_timing);
 
         // Store updated records
         env.storage().instance().set(&DataKey::Member(user), &member);
@@ -2169,21 +2379,77 @@ impl SoroSusuTrait for SoroSusu {
                     on_time_contributions: 0,
                     late_contributions: 0,
                 });
-                let volume_tier: u32 = if stats.total_volume_saved >= 10_000_000_000 { 3 }
-                    else if stats.total_volume_saved >= 1_000_000_000 { 2 }
-                    else { 1 };
-                let metadata = NftBadgeMetadata {
+                
+                // Get user's reputation data for comprehensive scoring
+                let reputation_key = DataKey::ReputationData(user.clone());
+                let reputation: ReputationData = env.storage().instance().get(&reputation_key).unwrap_or(ReputationData {
+                    user_address: user.clone(),
+                    susu_score: 0,
+                    reliability_score: 0,
+                    total_contributions: 0,
+                    on_time_rate: 0,
+                    volume_saved: 0,
+                    social_capital: 0,
+                    last_updated: 0,
+                    is_active: false,
+                });
+                
+                // Count total cycles completed by this user
+                let mut total_cycles: u32 = 0;
+                for cycle_key_bytes in env.storage().all_keys() {
+                    if let Ok(badge_token_id) = env.storage().instance().get::<DataKey, u128>(&DataKey::CycleBadge(user.clone(), 0)) {
+                        // This is a simplified check - in production would iterate through all circles
+                        total_cycles += 1;
+                    }
+                }
+                
+                // Enhanced volume tier with Platinum level
+                let volume_tier: u32 = if stats.total_volume_saved >= 100_000_000_000 { 4 } // Platinum
+                    else if stats.total_volume_saved >= 10_000_000_000 { 3 } // Gold
+                    else if stats.total_volume_saved >= 1_000_000_000 { 2 } // Silver
+                    else { 1 }; // Bronze
+                
+                // Build list of badges earned
+                let mut badges_earned = Vec::new(&env);
+                if stats.late_contributions == 0 {
+                    badges_earned.push_back(symbol_short!("PERFECT"));
+                }
+                if member_info.address == circle.creator {
+                    badges_earned.push_back(symbol_short!("LEADER"));
+                }
+                if total_cycles > 1 {
+                    badges_earned.push_back(symbol_short!("VETERAN"));
+                }
+                if volume_tier >= 3 {
+                    badges_earned.push_back(symbol_short!("ELITE"));
+                }
+                
+                // Calculate ecosystem participation (simplified - would query other contracts)
+                let ecosystem_participation: u32 = 1; // Minimum participation in this contract
+                
+                // Create Master Credential metadata
+                let metadata = MasterCredentialMetadata {
                     volume_tier,
                     perfect_attendance: stats.late_contributions == 0,
                     group_lead_status: member_info.address == circle.creator,
+                    total_cycles_completed: total_cycles + 1,
+                    total_volume_saved: stats.total_volume_saved,
+                    reliability_score: reputation.reliability_score,
+                    social_capital_score: reputation.social_capital,
+                    badges_earned,
+                    ecosystem_participation,
+                    mint_timestamp: env.ledger().timestamp(),
+                    circle_id,
+                    version: 1,
                 };
+                
                 // token_id: circle_id in upper 64 bits, member index in lower 64 bits
                 let token_id: u128 = ((circle_id as u128) << 64) | (member_info.index as u128);
                 let nft_client = SusuNftClient::new(&env, &circle.nft_contract);
-                nft_client.mint_badge(&user, &token_id, &metadata);
+                nft_client.mint_master_credential(&user, &token_id, &metadata);
                 env.storage().instance().set(&DataKey::CycleBadge(user.clone(), circle_id), &token_id);
                 env.events().publish(
-                    (symbol_short!("BADGE"), symbol_short!("MINT")),
+                    (symbol_short!("BADGE"), symbol_short!("MASTER")),
                     (user.clone(), circle_id, token_id, metadata),
                 );
             }
@@ -2205,8 +2471,17 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Unauthorized");
         }
 
-        if circle.is_insurance_used {
-            panic!("Insurance already used");
+        // Get the Group Insurance Fund
+        let mut insurance_fund: GroupInsuranceFund = env.storage().instance()
+            .get(&DataKey::GroupInsuranceFund(circle_id))
+            .expect("Group Insurance Fund not found");
+        
+        if !insurance_fund.is_active {
+            panic!("Insurance fund is not active");
+        }
+        
+        if insurance_fund.total_fund_balance <= 0 {
+            panic!("Insufficient insurance fund balance");
         }
 
         let member_key = DataKey::Member(member.clone());
@@ -2216,14 +2491,40 @@ impl SoroSusuTrait for SoroSusu {
             .get(&member_key)
             .expect("Member not found");
 
-        let amount_needed = circle.contribution_amount * member_info.tier_multiplier as i128;
-        if circle.insurance_balance < amount_needed {
-            panic!("Insufficient insurance");
+        // Calculate amount needed to cover the default (contribution for remaining rounds)
+        let rounds_remaining = circle.max_members - circle.current_recipient_index;
+        let amount_needed = circle.contribution_amount * (rounds_remaining as i128);
+        
+        if insurance_fund.total_fund_balance < amount_needed {
+            panic!("Insufficient insurance fund balance to cover default");
         }
 
-        circle.contribution_bitmap |= 1u64 << member_info.index;
-        circle.insurance_balance -= amount_needed;
-        circle.is_insurance_used = true;
+        // Deduct from insurance fund
+        insurance_fund.total_fund_balance -= amount_needed;
+        insurance_fund.total_claims_paid += amount_needed;
+        insurance_fund.last_claim_time = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::GroupInsuranceFund(circle_id), &insurance_fund);
+
+        // Update member's premium record to track claims
+        let mut premium_record: InsurancePremiumRecord = env.storage().instance()
+            .get(&DataKey::InsurancePremium(circle_id, member.clone()))
+            .unwrap_or(InsurancePremiumRecord {
+                member: member.clone(),
+                circle_id,
+                total_premium_paid: 0,
+                premium_payments: Vec::new(&env),
+                claims_made: 0,
+                net_contribution: 0,
+            });
+        
+        premium_record.claims_made += amount_needed;
+        premium_record.net_contribution = premium_record.total_premium_paid - premium_record.claims_made;
+        env.storage().instance().set(&DataKey::InsurancePremium(circle_id, member.clone()), &premium_record);
+
+        // Mark the member as defaulted
+        let mut member_status = member_info.status;
+        member_status = MemberStatus::Defaulted;
+        env.storage().instance().set(&DataKey::Member(member.clone()), &member_info);
 
         // The member defaulted and needed an insurance bailout, increment late count
         let user_stats_key = DataKey::UserStats(member.clone());
@@ -2236,12 +2537,84 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&user_stats_key, &user_stats);
 
         env.events().publish(
-            (Symbol::new(&env, "USER_STATS"), member.clone()),
-            (user_stats.on_time_contributions, user_stats.late_contributions, user_stats.total_volume_saved)
+            (Symbol::new(&env, "INSURANCE_CLAIM"), circle_id, member.clone()),
+            (amount_needed, insurance_fund.total_fund_balance),
         );
 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
         write_audit(&env, &caller, AuditAction::AdminAction, circle_id);
+    }
+
+    fn get_insurance_fund(env: Env, circle_id: u64) -> GroupInsuranceFund {
+        env.storage().instance()
+            .get(&DataKey::GroupInsuranceFund(circle_id))
+            .expect("Group Insurance Fund not found")
+    }
+
+    fn get_premium_record(env: Env, member: Address, circle_id: u64) -> InsurancePremiumRecord {
+        env.storage().instance()
+            .get(&DataKey::InsurancePremium(circle_id, member))
+            .expect("Premium record not found")
+    }
+
+    fn distribute_remaining_insurance_fund(env: Env, circle_id: u64) {
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        let mut insurance_fund: GroupInsuranceFund = env.storage().instance()
+            .get(&DataKey::GroupInsuranceFund(circle_id))
+            .expect("Group Insurance Fund not found");
+
+        // Check if cycle is complete (all members have received pot)
+        if circle.current_recipient_index < circle.max_members - 1 {
+            panic!("Cycle not complete - cannot distribute insurance fund yet");
+        }
+
+        if insurance_fund.total_fund_balance <= 0 {
+            panic!("No remaining insurance fund to distribute");
+        }
+
+        // Calculate pro-rata distribution based on premiums paid
+        let total_fund = insurance_fund.total_fund_balance;
+        let token_client = token::Client::new(&env, &circle.token);
+
+        for i in 0..circle.member_count {
+            let member_address = circle.member_addresses.get(i).unwrap();
+            
+            // Get member's premium record
+            if let Some(premium_record) = env.storage().instance()
+                .get::<DataKey, InsurancePremiumRecord>(&DataKey::InsurancePremium(circle_id, member_address.clone()))
+            {
+                // Calculate refund percentage based on premium paid
+                let refund_percentage = if insurance_fund.total_premiums_collected > 0 {
+                    (premium_record.total_premium_paid * 10_000) / insurance_fund.total_premiums_collected
+                } else {
+                    0
+                };
+                
+                let refund_amount = (total_fund * refund_percentage) / 10_000;
+                
+                if refund_amount > 0 {
+                    token_client.transfer(&env.current_contract_address(), &member_address, &refund_amount);
+                    
+                    env.events().publish(
+                        (Symbol::new(&env, "INSURANCE_REFUND"), circle_id, member_address.clone()),
+                        (refund_amount, premium_record.total_premium_paid),
+                    );
+                }
+            }
+        }
+
+        // Reset insurance fund for next cycle or mark as inactive
+        insurance_fund.total_fund_balance = 0;
+        insurance_fund.is_active = false;
+        env.storage().instance().set(&DataKey::GroupInsuranceFund(circle_id), &insurance_fund);
+
+        env.events().publish(
+            (Symbol::new(&env, "INSURANCE_FUND_DISTRIBUTED"), circle_id),
+            (total_fund, circle.member_count),
+        );
     }
 
     fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32) {
@@ -2740,6 +3113,292 @@ impl SoroSusuTrait for SoroSusu {
         env.events().publish(
             (Symbol::new(&env, "ROLLOVER_APPLIED"), circle_id),
             (rollover_bonus.bonus_amount, rollover_bonus.applied_cycle.unwrap()),
+        );
+    }
+
+    // Price Oracle and Asset Swap Implementation
+    
+    fn update_price_oracle(env: Env, oracle_provider: Address, asset: Address, price: i128) {
+        // Only authorized oracle providers can update prices (in production, use multi-sig or trusted oracles)
+        oracle_provider.require_auth();
+        
+        if price <= 0 {
+            panic!("Invalid price");
+        }
+        
+        let oracle_data = PriceOracleData {
+            asset_address: asset.clone(),
+            current_price: price,
+            last_updated: env.ledger().timestamp(),
+            is_stable_asset: false, // Would be determined by oracle provider
+        };
+        
+        env.storage().instance().set(&DataKey::PriceOracle(asset), &oracle_data);
+        
+        env.events().publish(
+            (Symbol::new(&env, "PRICE_UPDATED"), asset),
+            (price, env.ledger().timestamp()),
+        );
+    }
+    
+    fn get_asset_price(env: Env, asset: Address) -> PriceOracleData {
+        env.storage().instance()
+            .get(&DataKey::PriceOracle(asset))
+            .expect("Asset price not found")
+    }
+    
+    fn set_hard_asset_basket(env: Env, admin: Address, gold_weight_bps: u32, btc_weight_bps: u32, silver_weight_bps: u32) {
+        // Verify admin authorization
+        let stored_admin: Address = env.storage().instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"));
+        
+        if admin != stored_admin {
+            panic!("Unauthorized: only admin can set hard asset basket");
+        }
+        
+        let total_weight = gold_weight_bps + btc_weight_bps + silver_weight_bps;
+        if total_weight != 10000 {
+            panic!("Basket weights must sum to 10000 (100%)");
+        }
+        
+        let basket = HardAssetBasket {
+            gold_weight_bps,
+            btc_weight_bps,
+            silver_weight_bps,
+            total_weight_bps: total_weight,
+        };
+        
+        env.storage().instance().set(&DataKey::HardAssetBasket, &basket);
+        
+        env.events().publish(
+            (Symbol::new(&env, "HARD_ASSET_BASKET_SET")),
+            (gold_weight_bps, btc_weight_bps, silver_weight_bps),
+        );
+    }
+    
+    fn get_hard_asset_basket(env: Env) -> HardAssetBasket {
+        env.storage().instance()
+            .get(&DataKey::HardAssetBasket)
+            .unwrap_or(HardAssetBasket {
+                gold_weight_bps: DEFAULT_HARD_ASSET_GOLD_WEIGHT,
+                btc_weight_bps: DEFAULT_HARD_ASSET_BTC_WEIGHT,
+                silver_weight_bps: DEFAULT_HARD_ASSET_SILVER_WEIGHT,
+                total_weight_bps: 10000,
+            })
+    }
+    
+    fn check_price_drop_and_trigger_swap(env: Env, circle_id: u64) -> bool {
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        // Get current asset price
+        let current_price_data: PriceOracleData = match env.storage().instance().get(&DataKey::PriceOracle(circle.token.clone())) {
+            Some(data) => data,
+            None => return false, // No oracle data available
+        };
+        
+        // Calculate hard asset basket weighted price
+        let basket = Self::get_hard_asset_basket(env.clone());
+        
+        // Get prices for hard assets (simplified - would need actual oracle feeds)
+        // In production, this would query multiple oracle sources
+        let gold_price: PriceOracleData = match env.storage().instance().get(&DataKey::PriceOracle(Address::from_str("GOLD_ASSET_ADDRESS")?)) {
+            Some(data) => data,
+            None => return false,
+        };
+        
+        // Calculate if current asset dropped more than 20% against hard asset basket
+        // Simplified calculation: compare current price to a baseline
+        let price_drop_threshold = (current_price_data.current_price * PRICE_DROP_THRESHOLD_BPS as i128) / 10000;
+        
+        // This is simplified - in production would compare against historical baseline
+        let current_price = current_price_data.current_price;
+        let threshold_price = price_drop_threshold; // 20% drop from some baseline
+        
+        if current_price < threshold_price {
+            // Price drop detected - auto-trigger a swap proposal
+            let target_asset = Address::from_str("STABLE_ASSET_ADDRESS").expect("Invalid address"); // Would be configurable
+            Self::propose_asset_swap(env.clone(), circle.creator.clone(), circle_id, target_asset, 10000);
+            return true;
+        }
+        
+        false
+    }
+    
+    fn propose_asset_swap(env: Env, user: Address, circle_id: u64, target_asset: Address, swap_percentage_bps: u32) {
+        user.require_auth();
+        
+        if swap_percentage_bps > 10000 {
+            panic!("Swap percentage cannot exceed 100%");
+        }
+        
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        // Only circle creator or members can propose
+        let mut is_member = false;
+        for i in 0..circle.member_count {
+            if circle.member_addresses.get(i).unwrap() == user {
+                is_member = true;
+                break;
+            }
+        }
+        
+        if !is_member && user != circle.creator {
+            panic!("Unauthorized: only circle members can propose asset swap");
+        }
+        
+        // Get current asset price to calculate price drop
+        let current_price_data: PriceOracleData = match env.storage().instance().get(&DataKey::PriceOracle(circle.token.clone())) {
+            Some(data) => data,
+            None => panic!("Current asset price not found"),
+        };
+        
+        // Calculate price drop percentage (simplified)
+        let price_drop_bps = 2000; // Would be calculated from historical data
+        
+        let proposal = AssetSwapProposal {
+            circle_id,
+            proposer: user.clone(),
+            current_asset: circle.token.clone(),
+            target_asset,
+            swap_percentage_bps,
+            price_drop_percentage_bps: price_drop_bps,
+            created_timestamp: env.ledger().timestamp(),
+            voting_deadline: env.ledger().timestamp() + ASSET_SWAP_VOTING_PERIOD,
+            status: ProposalStatus::Active,
+            for_votes: 0,
+            against_votes: 0,
+            total_votes_cast: 0,
+            executed_timestamp: None,
+        };
+        
+        env.storage().instance().set(&DataKey::AssetSwapProposal(circle_id), &proposal);
+        
+        env.events().publish(
+            (Symbol::new(&env, "ASSET_SWAP_PROPOSED"), circle_id),
+            (user, target_asset, swap_percentage_bps),
+        );
+    }
+    
+    fn vote_asset_swap(env: Env, user: Address, circle_id: u64, vote_choice: QuadraticVoteChoice) {
+        user.require_auth();
+        
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let mut proposal: AssetSwapProposal = env.storage().instance()
+            .get(&DataKey::AssetSwapProposal(circle_id))
+            .expect("Asset swap proposal not found");
+        
+        if proposal.status != ProposalStatus::Active {
+            panic!("Proposal is not active");
+        }
+        
+        if env.ledger().timestamp() > proposal.voting_deadline {
+            panic!("Voting period has ended");
+        }
+        
+        // Check if user is a circle member
+        let mut is_member = false;
+        for i in 0..circle.member_count {
+            if circle.member_addresses.get(i).unwrap() == user {
+                is_member = true;
+                break;
+            }
+        }
+        
+        if !is_member {
+            panic!("Only circle members can vote");
+        }
+        
+        // Prevent duplicate voting
+        let vote_key = DataKey::AssetSwapVote(circle_id, user.clone());
+        if env.storage().instance().contains(&vote_key) {
+            panic!("Already voted on this proposal");
+        }
+        
+        // Record vote (simple 1 member = 1 vote for now, could use quadratic voting)
+        let vote_weight = 1u32;
+        
+        match vote_choice {
+            QuadraticVoteChoice::For => proposal.for_votes += vote_weight,
+            QuadraticVoteChoice::Against => proposal.against_votes += vote_weight,
+            QuadraticVoteChoice::Abstain => { /* Abstain doesn't count */ }
+        }
+        
+        proposal.total_votes_cast += vote_weight;
+        
+        // Store vote record
+        let vote_record = (vote_choice, env.ledger().timestamp());
+        env.storage().instance().set(&vote_key, &vote_record);
+        env.storage().instance().set(&DataKey::AssetSwapProposal(circle_id), &proposal);
+        
+        env.events().publish(
+            (Symbol::new(&env, "ASSET_SWAP_VOTE"), circle_id),
+            (user, vote_choice),
+        );
+    }
+    
+    fn execute_asset_swap(env: Env, circle_id: u64) {
+        let circle: CircleInfo = env.storage().instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let mut proposal: AssetSwapProposal = env.storage().instance()
+            .get(&DataKey::AssetSwapProposal(circle_id))
+            .expect("Asset swap proposal not found");
+        
+        if proposal.status != ProposalStatus::Active {
+            panic!("Proposal is not active");
+        }
+        
+        if env.ledger().timestamp() <= proposal.voting_deadline {
+            panic!("Voting period has not ended");
+        }
+        
+        // Check quorum
+        let participation_bps = (proposal.total_votes_cast as u32 * 10_000) / circle.member_count;
+        if participation_bps < ASSET_SWAP_QUORUM {
+            proposal.status = ProposalStatus::Rejected;
+            env.storage().instance().set(&DataKey::AssetSwapProposal(circle_id), &proposal);
+            panic!("Quorum not met");
+        }
+        
+        // Check majority
+        let approval_bps = if proposal.total_votes_cast > 0 {
+            (proposal.for_votes * 10_000) / proposal.total_votes_cast
+        } else {
+            0
+        };
+        
+        if approval_bps < ASSET_SWAP_MAJORITY {
+            proposal.status = ProposalStatus::Rejected;
+            env.storage().instance().set(&DataKey::AssetSwapProposal(circle_id), &proposal);
+            panic!("Majority not reached");
+        }
+        
+        // Execute the swap
+        proposal.status = ProposalStatus::Executed;
+        proposal.executed_timestamp = Some(env.ledger().timestamp());
+        
+        // Update circle's token to the new asset
+        let mut updated_circle = circle;
+        updated_circle.token = proposal.target_asset.clone();
+        env.storage().instance().set(&DataKey::Circle(circle_id), &updated_circle);
+        
+        // In production, would actually perform the token swap via DEX
+        // For now, we just update the accounting
+        
+        env.storage().instance().set(&DataKey::AssetSwapProposal(circle_id), &proposal);
+        
+        env.events().publish(
+            (Symbol::new(&env, "ASSET_SWAP_EXECUTED"), circle_id),
+            (proposal.current_asset, proposal.target_asset, proposal.swap_percentage_bps),
         );
     }
 
