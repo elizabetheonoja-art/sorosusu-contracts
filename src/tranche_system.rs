@@ -1,5 +1,5 @@
 // Tranche-Based Payout System - Anti "Payout-and-Run" Protection
-use soroban_sdk::{Address, Env, Symbol, token, panic, Vec, i128, u64, u32};
+use soroban_sdk::{Address, Env, Symbol, token, Vec};
 use crate::{
     DataKey, CircleInfo, Member, TrancheSchedule, TrancheInfo, TrancheStatus, 
     MemberContributionRecord, Error,
@@ -19,7 +19,7 @@ pub fn create_tranche_schedule(
     total_pot: i128,
 ) -> TrancheSchedule {
     let current_time = env.ledger().timestamp();
-    let current_round = circle.current_round;
+    let current_round = circle.current_recipient_index;
     
     // Calculate immediate payout (70%)
     let immediate_payout = (total_pot * TRANCHE_IMMEDIATE_PAYOUT_BPS as i128) / 10000;
@@ -108,7 +108,7 @@ pub fn claim_tranche(
         .ok_or(Error::CircleNotFound)?;
     
     let current_time = env.ledger().timestamp();
-    let is_unlocked_by_round = circle.current_round >= tranche.unlock_round;
+    let is_unlocked_by_round = circle.current_recipient_index >= tranche.unlock_round;
     let is_unlocked_by_time = current_time >= tranche.unlock_timestamp;
     
     if !is_unlocked_by_round && !is_unlocked_by_time {
@@ -120,7 +120,7 @@ pub fn claim_tranche(
     if env.storage().instance().has(&default_key) {
         // Mark tranche as clawed back
         tranche.status = TrancheStatus::ClawedBack;
-        schedule.tranches.set(tranche_index, &tranche);
+        schedule.tranches.set(tranche_index, tranche.clone());
         env.storage().instance().set(&schedule_key, &schedule);
         return Err(Error::MemberDefaulted);
     }
@@ -128,7 +128,7 @@ pub fn claim_tranche(
     // Check if member contributed in the previous round (eligibility check)
     let contribution_key = DataKey::MemberContributionRecord(
         circle_id,
-        circle.current_round.saturating_sub(1),
+        circle.current_recipient_index.saturating_sub(1),
         member.clone(),
     );
     
@@ -153,7 +153,7 @@ pub fn claim_tranche(
     // Mark as claimed
     tranche.status = TrancheStatus::Claimed;
     tranche.claimed_at = Some(current_time);
-    schedule.tranches.set(tranche_index, &tranche);
+    schedule.tranches.set(tranche_index, tranche.clone());
     
     // Check if all tranches are complete
     let all_claimed_or_clawed = schedule.tranches.iter().all(|t: TrancheInfo| {
@@ -207,14 +207,14 @@ pub fn mark_member_defaulted(
     
     let contribution_key = DataKey::MemberContributionRecord(
         circle_id,
-        circle.current_round,
+        circle.current_recipient_index,
         member.clone(),
     );
     
     let contribution_record = MemberContributionRecord {
         member: member.clone(),
         circle_id,
-        round: circle.current_round,
+        round: circle.current_recipient_index,
         contributed_on_time: false,
         contribution_timestamp: 0,
         is_defaulted: true,
@@ -225,7 +225,7 @@ pub fn mark_member_defaulted(
     // Emit event
     env.events().publish(
         (Symbol::new(env, "MEMBER_DEFAULTED"), circle_id, member.clone()),
-        (circle.current_round, env.ledger().timestamp()),
+        (circle.current_recipient_index, env.ledger().timestamp()),
     );
     
     Ok(())
@@ -277,7 +277,7 @@ pub fn execute_tranche_clawback(
         if tranche.status == TrancheStatus::Locked || tranche.status == TrancheStatus::Unlocked {
             total_clawback += tranche.amount;
             tranche.status = TrancheStatus::ClawedBack;
-            schedule.tranches.set(i, &tranche);
+            schedule.tranches.set(i, tranche.clone());
         }
     }
     
@@ -337,7 +337,7 @@ pub fn record_contribution(
     let contribution_record = MemberContributionRecord {
         member: member.clone(),
         circle_id,
-        round: circle.current_round,
+        round: circle.current_recipient_index,
         contributed_on_time,
         contribution_timestamp: current_time,
         is_defaulted: !contributed_on_time,
@@ -345,7 +345,7 @@ pub fn record_contribution(
     
     let contribution_key = DataKey::MemberContributionRecord(
         circle_id,
-        circle.current_round,
+        circle.current_recipient_index,
         member.clone(),
     );
     
@@ -385,7 +385,7 @@ pub fn is_member_eligible_for_tranche(
         let circle: Option<CircleInfo> = env.storage().instance().get(&DataKey::Circle(circle_id));
         if let Some(circle) = circle {
             let current_time = env.ledger().timestamp();
-            return circle.current_round >= tranche.unlock_round || current_time >= tranche.unlock_timestamp;
+            return circle.current_recipient_index >= tranche.unlock_round || current_time >= tranche.unlock_timestamp;
         }
     }
     

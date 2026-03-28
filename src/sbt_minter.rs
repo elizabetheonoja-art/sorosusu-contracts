@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec, Map, i128, u64, u32,
+    Address, Env, String, Symbol, Vec, Map,
 };
 
 use crate::{
@@ -67,6 +67,7 @@ pub struct UserReputationMetrics {
     pub total_cycles: u32,
     pub perfect_cycles: u32,
     pub last_updated: u64,
+    pub total_volume_saved: i128,
 }
 
 // --- SBT CREDENTIAL MINTER CONTRACT ---
@@ -134,6 +135,7 @@ impl SoroSusuSbtMinter {
                 total_cycles: 0,
                 perfect_cycles: 0,
                 last_updated: env.ledger().timestamp(),
+                total_volume_saved: 0,
             });
         
         // Update user metrics based on milestone completion
@@ -216,13 +218,14 @@ impl SoroSusuSbtMinter {
             .get(&DataKey::SoroSusuCredential(token_id))
             .unwrap_or_else(|| panic!("Credential not found"));
         
+        let is_revoking = matches!(new_status, SbtStatus::Dishonored | SbtStatus::Revoked);
         credential.status = new_status;
         credential.last_activity = env.ledger().timestamp();
         
         env.storage().instance().set(&DataKey::SoroSusuCredential(token_id), &credential);
         
         // If revoking, update user reputation
-        if matches!(new_status, SbtStatus::Dishonored | SbtStatus::Revoked) {
+        if is_revoking {
             let mut user_metrics: UserReputationMetrics = env.storage().instance()
                 .get(&DataKey::UserReputationScore(credential.holder.clone()))
                 .unwrap_or_else(|| UserReputationMetrics {
@@ -231,6 +234,7 @@ impl SoroSusuSbtMinter {
                     total_cycles: 0,
                     perfect_cycles: 0,
                     last_updated: env.ledger().timestamp(),
+                    total_volume_saved: 0,
                 });
             
             // Significantly reduce reputation scores
@@ -268,6 +272,7 @@ impl SoroSusuSbtMinter {
                 total_cycles: 0,
                 perfect_cycles: 0,
                 last_updated: env.ledger().timestamp(),
+                total_volume_saved: 0,
             });
         
         // Severe reputation penalty for revocation
@@ -287,7 +292,7 @@ impl SoroSusuSbtMinter {
             actor: admin,
             action: AuditAction::AdminAction,
             timestamp: env.ledger().timestamp(),
-            resource_id: token_id,
+            resource_id: token_id as u64,
         };
         
         env.storage().instance().set(&DataKey::AuditEntry(audit_count), &audit_entry);
@@ -366,11 +371,12 @@ impl SoroSusuSbtMinter {
                 total_cycles: 0,
                 perfect_cycles: 0,
                 last_updated: env.ledger().timestamp(),
+                total_volume_saved: 0,
             });
         
         // Get user's current credential to check tier
         if let Some(token_id) = env.storage().instance().get(&DataKey::UserCredential(user.clone())) {
-            if let Some(credential) = env.storage().instance().get(&DataKey::SoroSusuCredential(token_id)) {
+            if let Some(credential) = env.storage().instance().get::<DataKey, SoroSusuCredential>(&DataKey::SoroSusuCredential(token_id)) {
                 // Update based on credential tier
                 user_metrics.reliability_score = (credential.reliability_score + 5000).min(10000);
                 user_metrics.social_capital_score = (credential.social_capital_score + 5000).min(10000);
@@ -393,6 +399,7 @@ impl SoroSusuSbtMinter {
                 total_cycles: 0,
                 perfect_cycles: 0,
                 last_updated: env.ledger().timestamp(),
+                total_volume_saved: 0,
             });
         
         (

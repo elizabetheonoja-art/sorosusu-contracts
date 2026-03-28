@@ -1,12 +1,14 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec, Map, i128, u64, u32,
+    Address, Env, String, Symbol, Vec, Map,
 };
 
 use crate::{
-    SoroSusuTrait, Error, DataKey, CircleInfo, Member, UserStats, 
-    SusuNftClient, SusuNftTrait, AuditEntry, AuditAction
+    SoroSusuTrait, Error, DataKey, CircleInfo, Member, UserStats,
+    SusuNftClient, SusuNftTrait, AuditEntry, AuditAction,
+    LENDING_MARKET_VOTING_PERIOD, LENDING_MARKET_EMERGENCY_PERIOD,
+    BASE_INTEREST_RATE_BPS, MIN_LENDING_AMOUNT, LIQUIDITY_PROVIDER_YIELD_BPS,
 };
 
 // --- INTER-SUSU LENDING MARKET LIQUIDITY HOOK ---
@@ -246,7 +248,7 @@ impl InterSusuLendingMarket {
         }
         
         // Create pool ID
-        let pool_id = env.ledger().sequence();
+        let pool_id = env.ledger().sequence() as u64;
         
         // Create lending pool
         let pool = LendingPoolInfo {
@@ -359,7 +361,7 @@ impl InterSusuLendingMarket {
         }
         
         // Create lending position
-        let position_id = env.ledger().sequence();
+        let position_id = env.ledger().sequence() as u64;
         let position = LendingPosition {
             position_id,
             borrower: borrower.clone(),
@@ -378,7 +380,7 @@ impl InterSusuLendingMarket {
         };
         
         // Create repayment schedule
-        let schedule_id = env.ledger().sequence();
+        let schedule_id = env.ledger().sequence() as u64;
         let schedule = RepaymentSchedule {
             schedule_id,
             position_id,
@@ -467,7 +469,7 @@ impl InterSusuLendingMarket {
         }
         
         // Create or update liquidity provider
-        let provider_id = env.ledger().sequence();
+        let provider_id = env.ledger().sequence() as u64;
         let provider = LiquidityProvider {
             provider_circle_id: pool.lender_circle_id,
             total_contributed: amount,
@@ -515,7 +517,7 @@ impl InterSusuLendingMarket {
         position.last_payment_timestamp = Some(env.ledger().timestamp());
         
         // Calculate interest for this payment
-        let interest_portion = (payment_amount * position.interest_rate_bps) / 10000;
+        let interest_portion = (payment_amount * position.interest_rate_bps as i128) / 10000;
         let principal_portion = payment_amount - interest_portion;
         
         // Update repayment schedule
@@ -542,7 +544,7 @@ impl InterSusuLendingMarket {
             env.storage().instance().set(&DataKey::LendingPosition(position_id), &position);
             
             // Update pool availability (return principal + interest)
-            pool = env.storage().instance()
+            let mut pool: LendingPoolInfo = env.storage().instance()
                 .get(&DataKey::LendingPoolInfo(position.lender_circle_id))
                 .unwrap_or_else(|| panic!("Pool not found"));
             
@@ -605,14 +607,14 @@ impl InterSusuLendingMarket {
         };
         
         // Calculate reliability score (combination of on-time rate and volume)
-        let reliability_score = (on_time_rate + 
+        let reliability_score = (on_time_rate as i128 + 
             ((user_stats.total_volume_saved / 1000000).min(100) * 50)) / 100;
         
-        if reliability_score >= 8000 && on_time_rate >= 9500 {
+        if reliability_score >= 8000 && on_time_rate as i128 >= 9500 {
             RiskCategory::LowRisk
-        } else if reliability_score >= 6000 && on_time_rate >= 8500 {
+        } else if reliability_score >= 6000 && on_time_rate as i128 >= 8500 {
             RiskCategory::MediumRisk
-        } else if reliability_score >= 4000 && on_time_rate >= 7000 {
+        } else if reliability_score >= 4000 && on_time_rate as i128 >= 7000 {
             RiskCategory::HighRisk
         } else {
             RiskCategory::VeryHighRisk
@@ -640,7 +642,7 @@ impl InterSusuLendingMarket {
             .unwrap_or_else(|| panic!("Lending market not initialized"));
         
         // Create emergency loan request
-        let loan_id = env.ledger().sequence();
+        let loan_id = env.ledger().sequence() as u64;
         let emergency_loan = EmergencyLoan {
             loan_id,
             requester_circle_id,
@@ -698,7 +700,7 @@ impl InterSusuLendingMarket {
             // In a real implementation, this would trigger the actual loan disbursement
             env.events().publish(
                 (Symbol::new(&env, "emergency_loan_approved"), loan_id),
-                (amount, borrower_circle_id),
+                (loan.amount, loan.borrower_circle_id),
             );
         } else {
             // Reject loan

@@ -5,13 +5,6 @@ use soroban_sdk::{
 };
 
 mod stealth_mode;
-mod sbt_minter;
-mod lending_market;
-mod liquidity_buffer;
-mod tranche_system;
-pub use sbt_minter::*;
-pub use lending_market::*;
-pub use liquidity_buffer::*;
 
 // --- ERROR CODES ---
 
@@ -54,11 +47,6 @@ pub enum Error {
     InvalidProposalType = 33,
     QuorumNotMet = 34,
     ProposalExpired = 35,
-    TrancheNotFound = 36,
-    TrancheAlreadyClaimed = 37,
-    MemberDefaulted = 38,
-    TrancheNotUnlocked = 39,
-    TrancheClawbackFailed = 40,
 }
 
 // --- CONSTANTS ---
@@ -76,22 +64,6 @@ const MIN_GROUP_SIZE_FOR_QUADRATIC: u32 = 10; // Enable quadratic voting for gro
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
 const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
 const MAX_QUERY_LIMIT: u32 = 100;
-// Lending market constants
-const LENDING_MARKET_VOTING_PERIOD: u64 = 86400; // 24 hours
-const LENDING_MARKET_EMERGENCY_PERIOD: u64 = 21600; // 6 hours
-const BASE_INTEREST_RATE_BPS: u32 = 500; // 5% base annual interest rate
-const MIN_LENDING_AMOUNT: i128 = 100_000_000; // Minimum 10 tokens
-const LIQUIDITY_PROVIDER_YIELD_BPS: u32 = 200; // 2% annual yield
-// Liquidity buffer constants
-const LIQUIDITY_BUFFER_ADVANCE_PERIOD: u64 = 172800; // 48 hours
-const LIQUIDITY_BUFFER_MIN_REPUTATION: u32 = 10000; // 100% reputation required
-const LIQUIDITY_BUFFER_MAX_ADVANCE_BPS: u32 = 10000; // 100% of contribution
-const LIQUIDITY_BUFFER_PLATFORM_FEE_ALLOCATION: u32 = 2000; // 20% of platform fees
-const LIQUIDITY_BUFFER_MIN_RESERVE: i128 = 1_000_000_000; // Minimum 100 tokens
-const LIQUIDITY_BUFFER_MAX_RESERVE: i128 = 10_000_000_000; // Maximum 10,000 tokens
-const LIQUIDITY_BUFFER_ADVANCE_FEE_BPS: u32 = 50; // 0.5% fee
-const LIQUIDITY_BUFFER_GRACE_PERIOD: u64 = 86400; // 24 hours grace period
-const LIQUIDITY_BUFFER_MAX_ADVANCES_PER_ROUND: u32 = 3; // Maximum advances per round
 
 // --- DATA STRUCTURES ---
 
@@ -123,36 +95,6 @@ pub enum DataKey {
     AuditByActor(Address),
     AuditByResource(u64),
     AuditAll,
-    // Tranche system
-    TrancheSchedule(u64, Address),
-    DefaultedMember(u64, Address),
-    MemberContributionRecord(u64, u32, Address),
-    GroupInsuranceFund(u64),
-    // Liquidity buffer
-    LiquidityBufferConfig,
-    LiquidityAdvanceCounter,
-    LiquidityAdvance(u64),
-    MemberAdvanceHistory(Address),
-    LiquidityBufferReserve,
-    LiquidityBufferStats,
-    PlatformFeeAllocation,
-    // User stats
-    UserStats(Address),
-    // Lending market
-    LendingMarketConfig,
-    LendingMarketStats,
-    LendingPoolInfo(u64),
-    LendingPosition(u64),
-    RepaymentSchedule(u64),
-    LiquidityProvider(u64),
-    EmergencyLoan(u64),
-    // SBT minter
-    SbtMinterAdmin,
-    MilestoneCounter,
-    ReputationMilestone(u64),
-    UserReputationScore(Address),
-    SoroSusuCredential(u128),
-    UserCredential(Address),
 }
 
 #[contracttype]
@@ -389,240 +331,10 @@ pub struct AuditEntry {
     pub resource_id: u64,
 }
 
-// --- MISSING TYPES FROM LATER FEATURE BRANCHES ---
-
-#[contracttype]
-#[derive(Clone)]
-pub struct NftBadgeMetadata {
-    pub volume_tier: u32,
-    pub perfect_attendance: bool,
-    pub group_lead_status: bool,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct UserStats {
-    pub total_volume_saved: i128,
-    pub on_time_contributions: u32,
-    pub late_contributions: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct AssetWeight {
-    pub token: Address,
-    pub weight_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum TrancheStatus {
-    Locked,
-    Unlocked,
-    Claimed,
-    ClawedBack,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct TrancheInfo {
-    pub amount: i128,
-    pub unlock_round: u32,
-    pub unlock_timestamp: u64,
-    pub status: TrancheStatus,
-    pub created_at: u64,
-    pub claimed_at: Option<u64>,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct TrancheSchedule {
-    pub winner: Address,
-    pub circle_id: u64,
-    pub total_pot: i128,
-    pub immediate_payout: i128,
-    pub tranches: Vec<TrancheInfo>,
-    pub created_at: u64,
-    pub is_complete: bool,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct MemberContributionRecord {
-    pub member: Address,
-    pub circle_id: u64,
-    pub round: u32,
-    pub contributed_on_time: bool,
-    pub contribution_timestamp: u64,
-    pub is_defaulted: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum LiquidityAdvanceStatus {
-    Pending,
-    Active,
-    Completed,
-    Defaulted,
-    Cancelled,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct LiquidityBufferConfig {
-    pub is_enabled: bool,
-    pub advance_period: u64,
-    pub min_reputation: u32,
-    pub max_advance_bps: u32,
-    pub platform_fee_allocation: u32,
-    pub min_reserve: i128,
-    pub max_reserve: i128,
-    pub advance_fee_bps: u32,
-    pub grace_period: u64,
-    pub max_advances_per_round: u32,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct LiquidityAdvance {
-    pub advance_id: u64,
-    pub member: Address,
-    pub circle_id: u64,
-    pub round_number: u32,
-    pub contribution_amount: i128,
-    pub advance_amount: i128,
-    pub advance_fee: i128,
-    pub repayment_amount: i128,
-    pub status: LiquidityAdvanceStatus,
-    pub requested_timestamp: u64,
-    pub provided_timestamp: Option<u64>,
-    pub repayment_deadline: u64,
-    pub repaid_timestamp: Option<u64>,
-    pub reason: String,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct MemberAdvanceHistory {
-    pub member: Address,
-    pub total_advances_taken: u32,
-    pub total_advance_amount: i128,
-    pub total_fees_paid: i128,
-    pub current_round_advances: u32,
-    pub last_advance_timestamp: Option<u64>,
-    pub repayment_history: Vec<u64>,
-    pub default_count: u32,
-    pub reputation_score: u32,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct LiquidityBufferStats {
-    pub total_reserve_balance: i128,
-    pub total_platform_fees_allocated: i128,
-    pub total_advances_provided: u64,
-    pub total_advances_completed: u64,
-    pub total_advances_defaulted: u64,
-    pub total_advance_amount: i128,
-    pub total_fees_collected: i128,
-    pub active_advances_count: u64,
-    pub average_advance_size: i128,
-    pub buffer_utilization_rate: u32,
-    pub last_updated: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct PlatformFeeAllocation {
-    pub total_fees_collected: i128,
-    pub buffer_allocation_amount: i128,
-    pub treasury_allocation_amount: i128,
-    pub last_allocation_timestamp: u64,
-    pub allocation_frequency: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct AnchorInfo {
-    pub anchor_address: Address,
-    pub anchor_name: String,
-    pub sep_version: String,
-    pub authorization_level: u32,
-    pub compliance_level: u32,
-    pub is_active: bool,
-    pub registration_timestamp: u64,
-    pub last_activity: u64,
-    pub supported_countries: Vec<String>,
-    pub max_deposit_amount: i128,
-    pub daily_deposit_limit: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct AnchorDeposit {
-    pub deposit_id: u64,
-    pub anchor_address: Address,
-    pub beneficiary_user: Address,
-    pub circle_id: u64,
-    pub amount: i128,
-    pub deposit_memo: String,
-    pub fiat_reference: String,
-    pub timestamp: u64,
-    pub compliance_verified: bool,
-    pub processed: bool,
-    pub sep_type: String,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum DissolutionVoteChoice {
-    Approve,
-    Reject,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum DissolutionStatus {
-    NotInitiated,
-    Voting,
-    Approved,
-    Refunding,
-    Completed,
-    Failed,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct RefundClaim {
-    pub member: Address,
-    pub circle_id: u64,
-    pub amount: i128,
-    pub claimed: bool,
-    pub claim_timestamp: Option<u64>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum RefundStatus {
-    Pending,
-    Claimed,
-    Forfeited,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct GroupInsuranceFund {
-    pub circle_id: u64,
-    pub balance: i128,
-}
-
-// --- NFT TRAIT ---
-
 #[contractclient(name = "SusuNftClient")]
 pub trait SusuNftTrait {
     fn mint(env: Env, to: Address, token_id: u128);
     fn burn(env: Env, from: Address, token_id: u128);
-    fn mint_badge(env: Env, to: Address, token_id: u128, metadata: NftBadgeMetadata);
 }
 
 #[contractclient(name = "LendingPoolClient")]

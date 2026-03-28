@@ -1,12 +1,19 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec, Map, i128, u64, u32,
+    Address, Env, String, Symbol, Vec, Map,
 };
 
 use crate::{
-    SoroSusuTrait, Error, DataKey, CircleInfo, Member, UserStats, 
-    SusuNftClient, SusuNftTrait, AuditEntry, AuditAction
+    SoroSusuTrait, Error, DataKey, CircleInfo, Member, UserStats,
+    SusuNftClient, SusuNftTrait, AuditEntry, AuditAction,
+    LiquidityBufferConfig, LiquidityAdvance, LiquidityAdvanceStatus,
+    MemberAdvanceHistory, LiquidityBufferStats, PlatformFeeAllocation,
+    LIQUIDITY_BUFFER_ADVANCE_PERIOD, LIQUIDITY_BUFFER_MIN_REPUTATION,
+    LIQUIDITY_BUFFER_MAX_ADVANCE_BPS, LIQUIDITY_BUFFER_PLATFORM_FEE_ALLOCATION,
+    LIQUIDITY_BUFFER_MIN_RESERVE, LIQUIDITY_BUFFER_MAX_RESERVE,
+    LIQUIDITY_BUFFER_ADVANCE_FEE_BPS, LIQUIDITY_BUFFER_GRACE_PERIOD,
+    LIQUIDITY_BUFFER_MAX_ADVANCES_PER_ROUND,
 };
 
 // --- POT LIQUIDITY BUFFER FOR BANK HOLIDAYS ---
@@ -107,7 +114,7 @@ impl PotLiquidityBuffer {
         }
         
         // Check member eligibility
-        if !Self::check_advance_eligibility(&env, member.clone(), circle_id) {
+        if !Self::check_advance_eligibility(env.clone(), member.clone(), circle_id) {
             panic!("Member not eligible for advance");
         }
         
@@ -122,7 +129,7 @@ impl PotLiquidityBuffer {
         }
         
         // Check if within advance limits
-        let max_advance = (contribution_amount * config.max_advance_bps) / 10000;
+        let max_advance = (contribution_amount * config.max_advance_bps as i128) / 10000;
         if max_advance > contribution_amount {
             panic!("Advance amount exceeds contribution");
         }
@@ -160,14 +167,14 @@ impl PotLiquidityBuffer {
             .get(&DataKey::LiquidityAdvanceCounter)
             .unwrap_or(0) + 1;
         
-        let advance_fee = (max_advance * config.advance_fee_bps) / 10000;
+        let advance_fee = (max_advance * config.advance_fee_bps as i128) / 10000;
         let repayment_amount = max_advance + advance_fee;
         
         let advance = LiquidityAdvance {
             advance_id,
             member: member.clone(),
             circle_id,
-            round_number: circle.current_round,
+            round_number: circle.current_recipient_index,
             contribution_amount,
             advance_amount: max_advance,
             advance_fee,
@@ -274,7 +281,7 @@ impl PotLiquidityBuffer {
             .unwrap_or_else(|| panic!("Config not found"));
         
         if config.max_reserve > 0 {
-            stats.buffer_utilization_rate = ((config.max_reserve - reserve_balance) * 10000) / config.max_reserve;
+            stats.buffer_utilization_rate = (((config.max_reserve - reserve_balance) * 10000) / config.max_reserve) as u32;
         }
         
         env.storage().instance().set(&DataKey::LiquidityBufferStats, &stats);
@@ -361,17 +368,23 @@ impl PotLiquidityBuffer {
     // Process advance refill from member deposit
     pub fn process_advance_refill(env: Env, member: Address, circle_id: u64, deposit_amount: i128) {
         // Get member's advance history
-        let member_history: MemberAdvanceHistory = env.storage().instance()
+        let member_history: MemberAdvanceHistory = match env.storage().instance()
             .get(&DataKey::MemberAdvanceHistory(member.clone()))
-            .unwrap_or_else(|| return); // No advances to refill
+        {
+            Some(h) => h,
+            None => return, // No advances to refill
+        };
         
         // Find active advances for this member and circle
         let mut refilled_amount = 0;
         
         for advance_id in member_history.repayment_history.iter() {
-            let mut advance: LiquidityAdvance = env.storage().instance()
-                .get(&DataKey::LiquidityAdvance(*advance_id))
-                .unwrap_or_else(|| continue);
+            let mut advance: LiquidityAdvance = match env.storage().instance()
+                .get(&DataKey::LiquidityAdvance(advance_id))
+            {
+                Some(a) => a,
+                None => continue,
+            };
             
             // Only process advances for the same circle
             if advance.circle_id != circle_id {
@@ -430,7 +443,7 @@ impl PotLiquidityBuffer {
                 env.storage().instance().set(&DataKey::LiquidityBufferReserve, &reserve_balance);
                 
                 // Store updated advance
-                env.storage().instance().set(&DataKey::LiquidityAdvance(*advance_id), &advance);
+                env.storage().instance().set(&DataKey::LiquidityAdvance(advance_id), &advance);
                 
                 refilled_amount += apply_amount;
                 
@@ -444,7 +457,7 @@ impl PotLiquidityBuffer {
                     actor: member.clone(),
                     action: AuditAction::AdminAction,
                     timestamp: env.ledger().timestamp(),
-                    resource_id: *advance_id,
+                    resource_id: advance_id,
                 };
                 
                 env.storage().instance().set(&DataKey::AuditEntry(audit_count), &audit_entry);
@@ -460,9 +473,12 @@ impl PotLiquidityBuffer {
     // Check advance eligibility
     pub fn check_advance_eligibility(env: Env, member: Address, circle_id: u64) -> bool {
         // Get liquidity buffer config
-        let config: LiquidityBufferConfig = env.storage().instance()
+        let config: LiquidityBufferConfig = match env.storage().instance()
             .get(&DataKey::LiquidityBufferConfig)
-            .unwrap_or_else(|| return false);
+        {
+            Some(c) => c,
+            None => return false,
+        };
         
         // Check if buffer is enabled
         if !config.is_enabled {
@@ -492,11 +508,14 @@ impl PotLiquidityBuffer {
         }
         
         // Check if member is part of the circle
-        let circle: CircleInfo = env.storage().instance()
+        let circle: CircleInfo = match env.storage().instance()
             .get(&DataKey::Circle(circle_id))
-            .unwrap_or_else(|| return false);
+        {
+            Some(c) => c,
+            None => return false,
+        };
         
-        if !circle.members.contains(&member) {
+        if !circle.member_addresses.contains(member.clone()) {
             return false;
         }
         
@@ -532,7 +551,7 @@ impl PotLiquidityBuffer {
     // Get member advance history
     pub fn get_member_advance_history(env: Env, member: Address) -> MemberAdvanceHistory {
         env.storage().instance()
-            .get(&DataKey::MemberAdvanceHistory(member))
+            .get(&DataKey::MemberAdvanceHistory(member.clone()))
             .unwrap_or_else(|| MemberAdvanceHistory {
                 member,
                 total_advances_taken: 0,
@@ -572,7 +591,7 @@ impl PotLiquidityBuffer {
             .unwrap_or_else(|| panic!("Config not found"));
         
         // Calculate allocation amounts
-        let buffer_amount = (fee_amount * config.platform_fee_allocation) / 10000;
+        let buffer_amount = (fee_amount * config.platform_fee_allocation as i128) / 10000;
         let treasury_amount = fee_amount - buffer_amount;
         
         // Update allocation tracking
