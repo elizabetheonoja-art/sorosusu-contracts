@@ -366,19 +366,23 @@ mod tests {
     #[test]
     fn test_prepare_and_reveal_winner() {
         let env = Env::default();
-        init_stealth_mode(&env, 1, 9999);
+        let contract_id = env.register_contract(None, crate::SoroSusu);
 
-        let winner = prepare_next_winner(&env, 1, 5);
-        assert!(winner < 5);
+        env.as_contract(&contract_id, || {
+            init_stealth_mode(&env, 1, 9999);
 
-        let config_after_prepare = get_stealth_config(&env, 1);
-        assert_eq!(config_after_prepare.pending_winner, Some(winner));
-        assert_eq!(config_after_prepare.revealed_winner, None);
+            let winner = prepare_next_winner(&env, 1, 5);
+            assert!(winner < 5);
 
-        let revealed = reveal_winner(&env, 1);
-        assert_eq!(revealed, Some(winner));
+            let config_after_prepare = get_stealth_config(&env, 1);
+            assert_eq!(config_after_prepare.pending_winner, Some(winner));
+            assert_eq!(config_after_prepare.revealed_winner, None);
 
-        let config_after_reveal = get_stealth_config(&env, 1);
-        assert_eq!(config_after_reveal.revealed_winner, Some(winner));
+            let revealed = reveal_winner(&env, 1);
+            assert_eq!(revealed, Some(winner));
+
+            let config_after_reveal = get_stealth_config(&env, 1);
+            assert_eq!(config_after_reveal.revealed_winner, Some(winner));
+        });
     }
 }
