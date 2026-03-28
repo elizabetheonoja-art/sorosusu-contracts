@@ -4,6 +4,28 @@ Rust smart contracts for SoroSusu: a trustless, automated Rotating Savings and C
 
 ---
 
+## Features Overview
+
+### Core Savings Circle Functionality
+- Automated contribution collection and payout distribution
+- Randomized payout order option for fairness
+- Multi-cycle savings with group rollover
+- Collateral requirements for high-value circles
+
+### Social Underwriting System ⭐ **NEW**
+- **Guarantor Role**: High-reputation users can co-sign for new members
+- **Voucher System**: Social underwriting enables unbanked users to join high-trust groups
+- **Automatic Default Protection**: Collateral automatically pulled from guarantor on member default
+- **Reputation Economy**: Incentivizes good behavior through reputation scoring
+
+### Risk Management
+- Insurance coverage for member defaults
+- Buddy system for mutual support
+- Emergency withdrawal mechanisms
+- Rate limiting for spam prevention
+
+---
+
 ## Savings Group Lifecycle
 
 The diagram below shows the full lifecycle of a savings group, from creation through to final payout.
@@ -214,6 +236,14 @@ Returns a map of each member's contribution status (`true` = deposited) for the 
 | 1004 | `CircleNotFound` | No circle exists with the given ID |
 | 1005 | `Unauthorized` | Caller is not permitted to perform this action |
 | 1006 | `InvalidFeeConfig` | `fee_basis_points > 10,000` or treasury not set when fee > 0 |
+| 1021 | `GuarantorNotFound` | Guarantor not registered |
+| 1022 | `InsufficientReputation` | Reputation below minimum threshold |
+| 1023 | `GuarantorNotRegistered` | Not registered as guarantor |
+| 1024 | `VoucherAlreadyExists` | Voucher already exists for this circle |
+| 1025 | `VoucherNotFound` | Voucher not found |
+| 1026 | `GuarantorOverextended` | Maximum vouchers reached |
+| 1027 | `SelfGuaranteeNotAllowed` | Cannot guarantee self |
+| 1028 | `GuarantorInsufficientFunds` | Insufficient vault balance |
 
 ---
 

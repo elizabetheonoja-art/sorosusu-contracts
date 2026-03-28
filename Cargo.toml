@@ -6,7 +6,11 @@ description = "Core logic for the SoroSusu ROSCA protocol on Stellar"
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib"] # Essential for WASM compilation
+name = "sorosusu_contracts"
+crate-type = ["cdylib", "rlib"] # Essential for WASM compilation and integration tests
+
+[features]
+testutils = []
 
 [dependencies]
 soroban-sdk = "21.0.0"

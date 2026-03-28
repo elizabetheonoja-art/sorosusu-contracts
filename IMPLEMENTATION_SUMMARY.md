@@ -2,6 +2,38 @@
 
 ## Features Implemented
 
+### 0. Immutable Audit Log
+
+**Acceptance Criteria Met:**
+- ✅ Writes immutable audit entries for sensitive actions
+- ✅ Stores audit entries on-chain in append-only contract storage
+- ✅ Supports query by actor, resource, and time range
+- ✅ Integrates with governance, social recovery, and admin-sensitive flows
+- ✅ Includes test coverage for write and query behavior
+
+**Audit Entry Shape:**
+```rust
+pub struct AuditEntry {
+    pub id: u64,
+    pub actor: Address,
+    pub action: AuditAction,
+    pub timestamp: u64,
+    pub resource_id: u64,
+}
+```
+
+**Query Methods:**
+- `get_audit_entry()`
+- `query_audit_by_actor()`
+- `query_audit_by_resource()`
+- `query_audit_by_time()`
+
+**Indexing Strategy:**
+- Global append-only audit sequence
+- Per-actor audit ID index
+- Per-resource audit ID index
+- Global time-filterable audit ID list
+
 ### 1. Randomized Payout Order (Issue #23)
 
 **Acceptance Criteria Met:**
