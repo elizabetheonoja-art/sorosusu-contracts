@@ -155,6 +155,15 @@ pub trait SoroSusuTrait {
     fn get_member(env: Env, member: Address) -> Member;
     fn get_current_recipient(env: Env, circle_id: u64) -> Option<Address>;
 
+    // NEW: DEX Auto-Swap functions for fee stabilization
+    fn configure_dex_swap(env: Env, admin: Address, config: DexSwapConfig);
+    fn trigger_dex_swap(env: Env, admin: Address, circle_id: u64);
+    fn get_dex_swap_config(env: Env, circle_id: u64) -> Option<DexSwapConfig>;
+    fn get_dex_swap_record(env: Env, swap_id: u64) -> Option<DexSwapRecord>;
+    fn get_gas_reserve(env: Env, circle_id: u64) -> Option<GasReserve>;
+    fn emergency_pause_dex_swaps(env: Env, admin: Address);
+    fn emergency_refill_gas_reserve(env: Env, admin: Address, amount: i128);
+
     // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
     fn register_anchor(env: Env, admin: Address, anchor_info: AnchorInfo);
     fn deposit_for_user(
@@ -200,12 +209,11 @@ pub enum Error {
     InvalidDepositMemo = 20,
     DepositAlreadyProcessed = 21,
     ComplianceCheckFailed = 22,
-    // Batch payout specific errors
-    InvalidWinnersPerRound = 23,
-    BatchPayoutNotEnabled = 24,
-    InsufficientWinners = 25,
-    BatchPayoutAlreadyProcessed = 26,
-    DustCalculationError = 27,
+    DexSwapFailed = 23, // NEW
+    DexSwapCooldown = 24, // NEW
+    DexSwapThresholdNotMet = 25, // NEW
+    DexSwapSlippageExceeded = 26, // NEW
+    DexSwapEmergencyCooldown = 27, // NEW
 }
 
 // --- CONSTANTS ---
@@ -983,6 +991,59 @@ pub struct PaymentTimingRecord {
     pub payment_timestamp: u64,
     pub is_on_time: bool,
     pub payment_order: u32, // Order in which this payment was made (1 = first, 2 = second, etc.)
+}
+
+/// Individual Payout Claim - Track individual payout claims
+#[contracttype]
+#[derive(Clone)]
+pub struct IndividualPayoutClaim {
+    pub recipient: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub amount_claimed: i128,
+    pub claim_timestamp: u64,
+    pub batch_payout_id: u64, // Reference to batch payout record
+}
+
+// DEX Auto-Swap structures for fee stabilization
+#[contracttype]
+#[derive(Clone)]
+pub struct DexSwapConfig {
+    pub enabled: bool,                    // Whether auto-swap is enabled
+    pub swap_threshold_xlm: i128,        // Minimum XLM balance to trigger swap
+    pub swap_percentage_bps: u32,         // Percentage of USDC to swap (e.g., 5000 = 50%)
+    pub dex_contract: Address,             // Stellar DEX contract address
+    pub xlm_token: Address,               // Native XLM token address
+    pub slippage_tolerance_bps: u32,      // Maximum slippage tolerance (e.g., 100 = 1%)
+    pub minimum_swap_amount: i128,          // Minimum USDC amount to swap
+    pub emergency_pause: bool,              // Emergency pause flag
+    pub last_swap_timestamp: u64,           // Last successful swap timestamp
+    pub total_swapped_xlm: i128,          // Total XLM acquired via swaps
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct DexSwapRecord {
+    pub swap_id: u64,
+    pub circle_id: u64,
+    pub trigger_timestamp: u64,
+    pub usdc_amount: i128,               // USDC amount swapped
+    pub xlm_received: i128,             // XLM amount received
+    pub exchange_rate: i128,               // Exchange rate (XLM per USDC * 1M)
+    pub slippage_bps: u32,               // Actual slippage experienced
+    pub gas_used: i128,                    // Gas cost for swap transaction
+    pub execution_timestamp: u64,
+    pub success: bool,                      // Whether swap succeeded
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GasReserve {
+    pub xlm_balance: i128,                // Current XLM reserve for gas
+    pub reserved_for_ttl: i128,            // XLM reserved for next TTL bumps
+    pub auto_swap_enabled: bool,            // Whether auto-swap is active
+    pub last_refill_timestamp: u64,         // Last manual refill timestamp
+    pub consumption_rate: i128,              // XLM consumption per day
 }
 
 // --- POT LIQUIDITY BUFFER DATA STRUCTURES ---
