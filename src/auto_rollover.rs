@@ -21,6 +21,8 @@ const ROLLOVER_APPROVAL_THRESHOLD_BPS: u32 = 5100;
 
 /// Number of rounds before end to trigger continuity vote
 const ROLLOVER_TRIGGER_ROUNDS_BEFORE_END: u32 = 2;
+/// 10% tax withholding from earned interest
+const TAX_WITHHOLDING_BPS: u32 = 1000;
 
 /// Data key for rollover state per circle
 #[contracttype]
@@ -30,6 +32,8 @@ pub enum RolloverDataKey {
     RolloverVotes(u64),         // Vec of individual vote records
     RolloverPrepared(u64),      // Whether new instance has been prepared
     RolloverVotesCount(u64),    // Count of yes/no votes
+    TaxVault(u64, Address),     // Tax vault by (circle_id, user)
+    TaxVaultTotalWithheld(u64), // Aggregate withheld tax for circle
 }
 
 // --- DATA STRUCTURES ---
@@ -84,6 +88,29 @@ pub struct RolloverPreparation {
     pub members_joined: Vec<Address>,  // Members who confirmed rollover participation
 }
 
+/// Per-user tax vault balance and accounting state for interest withholding.
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxVault {
+    pub circle_id: u64,
+    pub owner: Address,
+    pub withheld_balance: i128,
+    pub total_withheld: i128,
+    pub total_claimed: i128,
+    pub last_withheld_timestamp: u64,
+    pub last_claim_timestamp: u64,
+}
+
+/// Return value of an interest-tax withholding operation.
+#[contracttype]
+#[derive(Clone)]
+pub struct TaxWithholdingResult {
+    pub gross_interest: i128,
+    pub tax_withheld: i128,
+    pub net_interest: i128,
+    pub resulting_tax_vault_balance: i128,
+}
+
 /// Default implementation for RolloverVote
 impl Default for RolloverVote {
     fn default() -> Self {
@@ -117,6 +144,20 @@ impl Default for RolloverPreparation {
             prepared_at: 0,
             is_complete: false,
             members_joined: Vec::new(&env),
+        }
+    }
+}
+
+impl TaxVault {
+    fn new(circle_id: u64, owner: Address) -> Self {
+        Self {
+            circle_id,
+            owner,
+            withheld_balance: 0,
+            total_withheld: 0,
+            total_claimed: 0,
+            last_withheld_timestamp: 0,
+            last_claim_timestamp: 0,
         }
     }
 }
@@ -305,6 +346,99 @@ pub fn get_rollover_preparation(env: &Env, circle_id: u64) -> RolloverPreparatio
     RolloverPreparation::default()
 }
 
+// --- TAX WITHHOLDING ESCROW FUNCTIONS ---
+
+/// Calculates 10% withholding from earned interest and net distributable interest.
+pub fn calculate_interest_tax_withholding(interest_earned: i128) -> (i128, i128) {
+    if interest_earned <= 0 {
+        return (0, interest_earned);
+    }
+
+    let tax_withheld = (interest_earned * TAX_WITHHOLDING_BPS as i128) / 10000;
+    let net_interest = interest_earned - tax_withheld;
+    (tax_withheld, net_interest)
+}
+
+/// Applies automatic tax withholding to interest earnings and credits the user's tax vault.
+pub fn withhold_tax_from_interest(
+    env: &Env,
+    circle_id: u64,
+    user: Address,
+    interest_earned: i128,
+) -> TaxWithholdingResult {
+    let (tax_withheld, net_interest) = calculate_interest_tax_withholding(interest_earned);
+    let key = RolloverDataKey::TaxVault(circle_id, user.clone());
+    let mut vault: TaxVault = env
+        .storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| TaxVault::new(circle_id, user));
+
+    if tax_withheld > 0 {
+        vault.withheld_balance += tax_withheld;
+        vault.total_withheld += tax_withheld;
+        vault.last_withheld_timestamp = env.ledger().timestamp();
+        env.storage().instance().set(&key, &vault);
+
+        let total_key = RolloverDataKey::TaxVaultTotalWithheld(circle_id);
+        let total_withheld: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&total_key, &(total_withheld + tax_withheld));
+    }
+
+    TaxWithholdingResult {
+        gross_interest: interest_earned,
+        tax_withheld,
+        net_interest,
+        resulting_tax_vault_balance: vault.withheld_balance,
+    }
+}
+
+/// Allows user to claim all withheld tax funds from their tax vault.
+/// This function returns the amount and clears the vault balance.
+pub fn claim_tax_vault(
+    env: &Env,
+    circle_id: u64,
+    user: Address,
+) -> Result<i128, TaxEscrowError> {
+    user.require_auth();
+
+    let key = RolloverDataKey::TaxVault(circle_id, user.clone());
+    let mut vault: TaxVault = env
+        .storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| TaxVault::new(circle_id, user));
+
+    if vault.withheld_balance <= 0 {
+        return Err(TaxEscrowError::NothingToClaim);
+    }
+
+    let claim_amount = vault.withheld_balance;
+    vault.withheld_balance = 0;
+    vault.total_claimed += claim_amount;
+    vault.last_claim_timestamp = env.ledger().timestamp();
+    env.storage().instance().set(&key, &vault);
+
+    Ok(claim_amount)
+}
+
+/// Reads the user's tax vault state.
+pub fn get_tax_vault(env: &Env, circle_id: u64, user: Address) -> TaxVault {
+    let key = RolloverDataKey::TaxVault(circle_id, user.clone());
+    env.storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| TaxVault::new(circle_id, user))
+}
+
+/// Reads the aggregate tax withheld for a circle.
+pub fn get_total_tax_withheld(env: &Env, circle_id: u64) -> i128 {
+    let key = RolloverDataKey::TaxVaultTotalWithheld(circle_id);
+    env.storage().instance().get(&key).unwrap_or(0)
+}
+
 // --- ERROR TYPES ---
 
 #[contracttype]
@@ -317,6 +451,13 @@ pub enum RolloverError {
     AlreadyVoted = 4,
     PreparationFailed = 5,
     NotAuthorized = 6,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum TaxEscrowError {
+    NothingToClaim = 1,
 }
 
 #[cfg(test)]
@@ -363,5 +504,52 @@ mod tests {
         assert!(vote.is_passed.is_none());
         assert_eq!(vote.yes_votes, 0);
         assert_eq!(vote.no_votes, 0);
+    }
+
+    #[test]
+    fn test_calculate_interest_tax_withholding() {
+        let (tax, net) = calculate_interest_tax_withholding(100_000_000);
+        assert_eq!(tax, 10_000_000);
+        assert_eq!(net, 90_000_000);
+
+        let (tax_zero, net_zero) = calculate_interest_tax_withholding(0);
+        assert_eq!(tax_zero, 0);
+        assert_eq!(net_zero, 0);
+    }
+
+    #[test]
+    fn test_withhold_tax_from_interest_credits_vault() {
+        let env = Env::default();
+        let user = Address::generate(&env);
+        let circle_id = 42u64;
+
+        let result = withhold_tax_from_interest(&env, circle_id, user.clone(), 50_000_000);
+        assert_eq!(result.tax_withheld, 5_000_000);
+        assert_eq!(result.net_interest, 45_000_000);
+        assert_eq!(result.resulting_tax_vault_balance, 5_000_000);
+
+        let vault = get_tax_vault(&env, circle_id, user);
+        assert_eq!(vault.withheld_balance, 5_000_000);
+        assert_eq!(vault.total_withheld, 5_000_000);
+        assert_eq!(get_total_tax_withheld(&env, circle_id), 5_000_000);
+    }
+
+    #[test]
+    fn test_claim_tax_vault() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let user = Address::generate(&env);
+        let circle_id = 7u64;
+
+        withhold_tax_from_interest(&env, circle_id, user.clone(), 10_000_000);
+        let claimed = claim_tax_vault(&env, circle_id, user.clone()).unwrap();
+        assert_eq!(claimed, 1_000_000);
+
+        let vault = get_tax_vault(&env, circle_id, user.clone());
+        assert_eq!(vault.withheld_balance, 0);
+        assert_eq!(vault.total_claimed, 1_000_000);
+
+        let nothing_left = claim_tax_vault(&env, circle_id, user);
+        assert_eq!(nothing_left, Err(TaxEscrowError::NothingToClaim));
     }
 }
