@@ -4688,6 +4688,207 @@ impl SoroSusuTrait for SoroSusu {
             }
         }
     }
+
+    fn generate_financial_statement(env: Env, user: Address) -> FinancialStatement {
+        let stats_key = DataKey::UserStats(user.clone());
+        let stats: UserStats = env.storage().instance().get(&stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+            total_won: 0,
+        });
+
+        let reputation = Self::get_reputation(env.clone(), user.clone());
+
+        FinancialStatement {
+            user: user.clone(),
+            total_contributed: stats.total_volume_saved,
+            total_won: stats.total_won,
+            average_reputation: reputation.susu_score,
+            generated_at: env.ledger().timestamp(),
+        }
+    }
+
+    fn detect_and_handle_clawback(env: Env, circle_id: u64) {
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let client = token::Client::new(&env, &circle.token);
+        let actual_balance = client.balance(&env.current_contract_address());
+        
+        if actual_balance < circle.expected_balance {
+            let deficit = circle.expected_balance - actual_balance;
+            circle.is_paused = true;
+            env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+            env.storage().instance().set(&DataKey::ClawbackDeficit(circle_id), &deficit);
+            
+            env.events().publish((Symbol::new(&env, "CLAWBACK_DETECTED"), circle_id), deficit);
+        }
+    }
+
+    fn pause_round(env: Env, admin: Address, circle_id: u64, reason: String) {
+        admin.require_auth();
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        if admin != circle.creator { panic!("Unauthorized"); }
+        circle.is_paused = true;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn propose_recovery_plan(env: Env, user: Address, circle_id: u64, recovery_type: RecoveryType) {
+        user.require_auth();
+        let deficit: i128 = env.storage().instance().get(&DataKey::ClawbackDeficit(circle_id)).unwrap_or(0);
+        if deficit == 0 { panic!("No deficit to recover"); }
+        
+        let plan = RecoveryPlan {
+            circle_id,
+            total_deficit: deficit,
+            recovery_type,
+            proposed_by: user,
+            votes_for: 0,
+            votes_against: 0,
+            is_active: true,
+        };
+        env.storage().instance().set(&DataKey::RecoveryPlanInfo(circle_id), &plan);
+    }
+
+    fn vote_recovery_plan(env: Env, user: Address, circle_id: u64, vote: bool) {
+        user.require_auth();
+        let mut plan: RecoveryPlan = env.storage().instance().get(&DataKey::RecoveryPlanInfo(circle_id)).unwrap();
+        if vote { plan.votes_for += 1; } else { plan.votes_against += 1; }
+        env.storage().instance().set(&DataKey::RecoveryPlanInfo(circle_id), &plan);
+    }
+
+    fn contribute_to_recovery(env: Env, user: Address, circle_id: u64, amount: i128) {
+        user.require_auth();
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let client = token::Client::new(&env, &circle.token);
+        client.transfer(&user, &env.current_contract_address(), &amount);
+        
+        let mut contributions: i128 = env.storage().instance().get(&DataKey::RecoveryContributions(circle_id, user.clone())).unwrap_or(0);
+        contributions += amount;
+        env.storage().instance().set(&DataKey::RecoveryContributions(circle_id, user), &contributions);
+    }
+
+    fn execute_recovery_plan(env: Env, admin: Address, circle_id: u64) {
+        admin.require_auth();
+        let mut plan: RecoveryPlan = env.storage().instance().get(&DataKey::RecoveryPlanInfo(circle_id)).unwrap();
+        if plan.votes_for <= plan.votes_against { panic!("Plan not approved"); }
+        plan.is_active = false;
+        env.storage().instance().set(&DataKey::RecoveryPlanInfo(circle_id), &plan);
+        
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        circle.expected_balance -= plan.total_deficit;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage().instance().set(&DataKey::ClawbackDeficit(circle_id), &0i128);
+    }
+
+    fn resume_round(env: Env, admin: Address, circle_id: u64) {
+        admin.require_auth();
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        if admin != circle.creator { panic!("Unauthorized"); }
+        circle.is_paused = false;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn raise_dispute(env: Env, user: Address, circle_id: u64, target: Address, amount: i128) -> u64 {
+        user.require_auth();
+        let mut dispute_count: u64 = env.storage().instance().get(&DataKey::DisputeCount).unwrap_or(0);
+        dispute_count += 1;
+        
+        let mut arbitrators = Vec::new(&env);
+        let circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
+        
+        if circle_count > 1 {
+            let mut seed = env.ledger().timestamp().wrapping_add(env.ledger().sequence() as u64);
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            
+            let start_circle = (seed % circle_count) + 1;
+            
+            for i in 0..circle_count {
+                let current_circle_id = ((start_circle + i - 1) % circle_count) + 1;
+                
+                if current_circle_id == circle_id {
+                    continue; // Must be outside the group
+                }
+                
+                if let Some(rand_circle) = env.storage().instance().get::<DataKey, CircleInfo>(&DataKey::Circle(current_circle_id)) {
+                    for j in 0..rand_circle.member_count {
+                        if let Some(member_addr) = rand_circle.member_addresses.get(j) {
+                            if !arbitrators.contains(&member_addr) {
+                                let rep = Self::get_reputation(env.clone(), member_addr.clone());
+                                if rep.susu_score >= 9000 {
+                                    arbitrators.push_back(member_addr);
+                                    if arbitrators.len() == 3 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if arbitrators.len() == 3 {
+                    break;
+                }
+            }
+        }
+        
+        let dispute = Dispute {
+            dispute_id: dispute_count,
+            circle_id,
+            raised_by: user.clone(),
+            target,
+            amount,
+            arbitrators,
+            votes_release: 0,
+            votes_refund: 0,
+            is_resolved: false,
+        };
+        
+        env.storage().instance().set(&DataKey::Dispute(dispute_count), &dispute);
+        env.storage().instance().set(&DataKey::DisputeCount, &dispute_count);
+        
+        dispute_count
+    }
+
+    fn vote_on_dispute(env: Env, arbitrator: Address, dispute_id: u64, release_funds: bool) {
+        arbitrator.require_auth();
+        
+        let mut dispute: Dispute = env.storage().instance().get(&DataKey::Dispute(dispute_id)).unwrap();
+        if dispute.is_resolved { panic!("Dispute already resolved"); }
+        
+        if !dispute.arbitrators.contains(&arbitrator) {
+            panic!("Not an assigned arbitrator for this dispute");
+        }
+        
+        let rep = Self::get_reputation(env.clone(), arbitrator.clone());
+        if rep.susu_score < 9000 {
+            panic!("Arbitrator must have near perfect reputation");
+        }
+        
+        let vote_key = DataKey::DisputeArbitratorVote(dispute_id, arbitrator.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted");
+        }
+        env.storage().instance().set(&vote_key, &true);
+        
+        if release_funds { dispute.votes_release += 1; } else { dispute.votes_refund += 1; }
+        
+        if dispute.votes_release >= 2 || dispute.votes_refund >= 2 {
+            dispute.is_resolved = true;
+            let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(dispute.circle_id)).unwrap();
+            let client = token::Client::new(&env, &circle.token);
+            if dispute.votes_release >= 2 {
+                client.transfer(&env.current_contract_address(), &dispute.target, &dispute.amount);
+            } else {
+                client.transfer(&env.current_contract_address(), &dispute.raised_by, &dispute.amount);
+            }
+            circle.expected_balance -= dispute.amount;
+            env.storage().instance().set(&DataKey::Circle(dispute.circle_id), &circle);
+        }
+        
+        env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
+    }
 }
 
 fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut YieldDelegation) {
@@ -4705,5 +4906,3 @@ fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut
     delegation.start_time = Some(current_time);
     delegation.last_compound_time = current_time;
 }
-
-
