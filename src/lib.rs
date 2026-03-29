@@ -2,6 +2,7 @@
 use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}};
 
 // --- DATA STRUCTURES ---
+const TAX_WITHHOLDING_BPS: u64 = 1000; // 10%
 
 #[contracttype]
 #[derive(Clone)]
@@ -21,6 +22,14 @@ pub enum DataKey {
     // #228: Governance
     Stake(Address),
     GlobalFeeBP, // Basis points
+    // Tax Withholding Escrow for Interest Earnings
+    TaxVault(u64, Address),          // circle_id, user
+    TaxWithheldTotal(u64),           // circle_id
+    TaxClaimedTotal(u64),            // circle_id
+    TaxWithheldByUser(u64, Address), // circle_id, user
+    TaxClaimedByUser(u64, Address),  // circle_id, user
+    GrossInterestTotal(u64),         // circle_id
+    GrossInterestByUser(u64, Address), // circle_id, user
 }
 
 #[contracttype]
@@ -58,6 +67,20 @@ pub struct CircleInfo {
     pub cycle_duration: u64, // Duration of each payment cycle in seconds
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TaxReport {
+    pub circle_id: u64,
+    pub user: Address,
+    pub gross_interest_total_for_circle: u64,
+    pub gross_interest_for_user: u64,
+    pub total_tax_withheld_for_circle: u64,
+    pub total_tax_withheld_for_user: u64,
+    pub total_tax_claimed_for_circle: u64,
+    pub total_tax_claimed_for_user: u64,
+    pub current_tax_vault_balance: u64,
+}
+
 // --- CONTRACT TRAIT ---
 
 pub trait SoroSusuTrait {
@@ -85,6 +108,28 @@ pub trait SoroSusuTrait {
     fn stake_xlm(env: Env, user: Address, xlm_token: Address, amount: u64);
     fn unstake_xlm(env: Env, user: Address, xlm_token: Address, amount: u64);
     fn update_global_fee(env: Env, admin: Address, new_fee: u32);
+
+    // Tax Withholding Escrow for Interest Earnings
+    fn process_interest_earning(env: Env, operator: Address, circle_id: u64, beneficiary: Address, gross_interest: u64) -> (u64, u64);
+    fn claim_tax_vault(env: Env, user: Address, circle_id: u64) -> u64;
+    fn get_tax_vault_balance(env: Env, user: Address, circle_id: u64) -> u64;
+    fn get_total_tax_withheld(env: Env, circle_id: u64) -> u64;
+    fn get_total_tax_claimed(env: Env, circle_id: u64) -> u64;
+    fn get_tax_report(env: Env, user: Address, circle_id: u64) -> TaxReport;
+}
+
+fn checked_add_u64(a: u64, b: u64, context: &str) -> u64 {
+    a.checked_add(b).unwrap_or_else(|| panic!("{}", context))
+}
+
+fn calculate_interest_tax_split(gross_interest: u64) -> (u64, u64) {
+    if gross_interest == 0 {
+        return (0, 0);
+    }
+
+    let tax_withheld = (gross_interest * TAX_WITHHOLDING_BPS) / 10_000;
+    let net_interest = gross_interest - tax_withheld;
+    (tax_withheld, net_interest)
 }
 
 // --- IMPLEMENTATION ---
@@ -396,6 +441,117 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         env.storage().instance().set(&DataKey::GlobalFeeBP, &new_fee);
+    }
+
+    fn process_interest_earning(env: Env, operator: Address, circle_id: u64, beneficiary: Address, gross_interest: u64) -> (u64, u64) {
+        operator.require_auth();
+        if gross_interest == 0 {
+            panic!("Gross interest must be > 0");
+        }
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if operator != stored_admin {
+            panic!("Only admin can process interest earnings");
+        }
+
+        // Ensure circle exists and discover token.
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+
+        let (tax_withheld, net_interest) = calculate_interest_tax_split(gross_interest);
+        let token_client = token::Client::new(&env, &circle.token);
+
+        // Interest inflow is deposited to contract first, then net is paid to beneficiary.
+        token_client.transfer(&operator, &env.current_contract_address(), &gross_interest);
+        if net_interest > 0 {
+            token_client.transfer(&env.current_contract_address(), &beneficiary, &net_interest);
+        }
+
+        // Update per-user tax vault and accounting totals.
+        let vault_key = DataKey::TaxVault(circle_id, beneficiary.clone());
+        let existing_vault: u64 = env.storage().instance().get(&vault_key).unwrap_or(0);
+        let updated_vault = checked_add_u64(existing_vault, tax_withheld, "Tax vault overflow");
+        env.storage().instance().set(&vault_key, &updated_vault);
+
+        let total_withheld_key = DataKey::TaxWithheldTotal(circle_id);
+        let total_withheld: u64 = env.storage().instance().get(&total_withheld_key).unwrap_or(0);
+        env.storage().instance().set(&total_withheld_key, &checked_add_u64(total_withheld, tax_withheld, "Total tax withheld overflow"));
+
+        let user_withheld_key = DataKey::TaxWithheldByUser(circle_id, beneficiary.clone());
+        let user_withheld: u64 = env.storage().instance().get(&user_withheld_key).unwrap_or(0);
+        env.storage().instance().set(&user_withheld_key, &checked_add_u64(user_withheld, tax_withheld, "User tax withheld overflow"));
+
+        let gross_total_key = DataKey::GrossInterestTotal(circle_id);
+        let gross_total: u64 = env.storage().instance().get(&gross_total_key).unwrap_or(0);
+        env.storage().instance().set(&gross_total_key, &checked_add_u64(gross_total, gross_interest, "Gross interest total overflow"));
+
+        let user_gross_key = DataKey::GrossInterestByUser(circle_id, beneficiary.clone());
+        let user_gross: u64 = env.storage().instance().get(&user_gross_key).unwrap_or(0);
+        env.storage().instance().set(&user_gross_key, &checked_add_u64(user_gross, gross_interest, "User gross interest overflow"));
+
+        env.events().publish(
+            (Symbol::new(&env, "tax_withheld"), circle_id, beneficiary.clone()),
+            (gross_interest, tax_withheld, net_interest, updated_vault),
+        );
+
+        (tax_withheld, net_interest)
+    }
+
+    fn claim_tax_vault(env: Env, user: Address, circle_id: u64) -> u64 {
+        user.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle not found"));
+        let vault_key = DataKey::TaxVault(circle_id, user.clone());
+        let claim_amount: u64 = env.storage().instance().get(&vault_key).unwrap_or(0);
+        if claim_amount == 0 {
+            panic!("Nothing to claim");
+        }
+
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&env.current_contract_address(), &user, &claim_amount);
+        env.storage().instance().set(&vault_key, &0u64);
+
+        let total_claimed_key = DataKey::TaxClaimedTotal(circle_id);
+        let total_claimed: u64 = env.storage().instance().get(&total_claimed_key).unwrap_or(0);
+        env.storage().instance().set(&total_claimed_key, &checked_add_u64(total_claimed, claim_amount, "Total tax claimed overflow"));
+
+        let user_claimed_key = DataKey::TaxClaimedByUser(circle_id, user.clone());
+        let user_claimed: u64 = env.storage().instance().get(&user_claimed_key).unwrap_or(0);
+        env.storage().instance().set(&user_claimed_key, &checked_add_u64(user_claimed, claim_amount, "User tax claimed overflow"));
+
+        env.events().publish(
+            (Symbol::new(&env, "tax_claimed"), circle_id, user.clone()),
+            claim_amount,
+        );
+
+        claim_amount
+    }
+
+    fn get_tax_vault_balance(env: Env, user: Address, circle_id: u64) -> u64 {
+        env.storage().instance().get(&DataKey::TaxVault(circle_id, user)).unwrap_or(0)
+    }
+
+    fn get_total_tax_withheld(env: Env, circle_id: u64) -> u64 {
+        env.storage().instance().get(&DataKey::TaxWithheldTotal(circle_id)).unwrap_or(0)
+    }
+
+    fn get_total_tax_claimed(env: Env, circle_id: u64) -> u64 {
+        env.storage().instance().get(&DataKey::TaxClaimedTotal(circle_id)).unwrap_or(0)
+    }
+
+    fn get_tax_report(env: Env, user: Address, circle_id: u64) -> TaxReport {
+        TaxReport {
+            circle_id,
+            user: user.clone(),
+            gross_interest_total_for_circle: env.storage().instance().get(&DataKey::GrossInterestTotal(circle_id)).unwrap_or(0),
+            gross_interest_for_user: env.storage().instance().get(&DataKey::GrossInterestByUser(circle_id, user.clone())).unwrap_or(0),
+            total_tax_withheld_for_circle: env.storage().instance().get(&DataKey::TaxWithheldTotal(circle_id)).unwrap_or(0),
+            total_tax_withheld_for_user: env.storage().instance().get(&DataKey::TaxWithheldByUser(circle_id, user.clone())).unwrap_or(0),
+            total_tax_claimed_for_circle: env.storage().instance().get(&DataKey::TaxClaimedTotal(circle_id)).unwrap_or(0),
+            total_tax_claimed_for_user: env.storage().instance().get(&DataKey::TaxClaimedByUser(circle_id, user.clone())).unwrap_or(0),
+            current_tax_vault_balance: env.storage().instance().get(&DataKey::TaxVault(circle_id, user)).unwrap_or(0),
+        }
     }
 }
 
