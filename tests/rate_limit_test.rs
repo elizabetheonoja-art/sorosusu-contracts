@@ -1,7 +1,4 @@
-use sorosusu_contracts::{SoroSusu, SoroSusuClient};
 #[cfg(test)]
-use soroban_sdk::testutils::Address as _;
-
 #[test]
 fn test_rate_limit_enforcement() {
     // Simulate timestamps

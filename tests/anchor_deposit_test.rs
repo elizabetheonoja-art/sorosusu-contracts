@@ -1,6 +1,7 @@
-#![cfg_attr(not(test), no_std)]
-use soroban_sdk::{testutils::Address as _, Address, Env, token, Vec, String};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient, AnchorInfo, AnchorDeposit, AuditAction};
+#![cfg(test)]
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient, AnchorInfo};
 
 #[contract]
 pub struct MockNft;
@@ -50,16 +51,16 @@ fn test_anchor_deposit_flow() {
     client.register_anchor(&admin, &anchor_info);
     token_client.mint(&anchor_address, &10_000_000_000);
 
-    let circle_id = client.create_circle(&creator, &1_000_000_000, &2, &token_id, &86400, &0);
+    let circle_id = client.create_circle(&creator, &1_000_000_000i128, &2u32, &token_id, &86400u64, &0i128);
     client.join_circle(&user, &circle_id);
 
     let memo = String::from_str(&env, "DEP_123");
     let fiat = String::from_str(&env, "BANK_TX");
     let sep = String::from_str(&env, "SEP-24");
 
-    client.deposit_for_user(&anchor_address, &user, &circle_id, &1_000_000_000, &memo, &fiat, &sep);
+    client.deposit_for_user(&anchor_address, &user, &circle_id, &1_000_000_000i128, &memo, &fiat, &sep);
 
-    let deposit_id = env.ledger().sequence() as u64; // Based on implementation
+    let deposit_id = 1u64; // In mock logic it's 1
     let record = client.get_deposit_record(&deposit_id);
     assert!(record.processed);
     assert_eq!(record.beneficiary_user, user);

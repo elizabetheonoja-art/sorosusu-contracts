@@ -3,7 +3,7 @@
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec
 };
 
 // Import SoroSusu contract types
@@ -125,12 +125,12 @@ impl LendingTrait for SoroSusuLending {
             6000..=7999 => (false, 6000),     // Good - no collateral needed
             4000..=5999 => (true, 4000),      // Fair - collateral required
             2000..=3999 => (true, 2000),      // Poor - collateral required, higher threshold
-            _ => return env.panic_with_error!(Error::InsufficientReputation), // Very Poor - denied
+            _ => env.panic_with_error(Error::InsufficientReputation), // Very Poor - denied
         };
 
         // Check if user meets reputation threshold
         if reputation.susu_score < reputation_threshold {
-            env.panic_with_error!(Error::InsufficientReputation);
+            env.panic_with_error(Error::InsufficientReputation);
         }
 
         // Check for existing active loans
@@ -145,7 +145,7 @@ impl LendingTrait for SoroSusuLending {
             let loan_key = DataKey::Loan(loan_id);
             if let Some(loan) = env.storage().instance().get::<DataKey, Loan>(&loan_key) {
                 if loan.is_active {
-                    env.panic_with_error!(Error::LoanAlreadyActive);
+                    env.panic_with_error(Error::LoanAlreadyActive);
                 }
             }
         }
@@ -206,7 +206,7 @@ impl LendingTrait for SoroSusuLending {
             .expect("Admin not set");
 
         if lender != admin {
-            env.panic_with_error!(Error::Unauthorized);
+            env.panic_with_error(Error::Unauthorized);
         }
 
         let loan_key = DataKey::Loan(loan_id);
@@ -217,7 +217,7 @@ impl LendingTrait for SoroSusuLending {
             .expect("Loan not found");
 
         if loan.is_active {
-            env.panic_with_error!(Error::LoanAlreadyActive);
+            env.panic_with_error(Error::LoanAlreadyActive);
         }
 
         // Activate the loan
@@ -242,11 +242,11 @@ impl LendingTrait for SoroSusuLending {
             .expect("Loan not found");
 
         if loan.borrower != borrower {
-            env.panic_with_error!(Error::Unauthorized);
+            env.panic_with_error(Error::Unauthorized);
         }
 
         if !loan.is_active {
-            env.panic_with_error!(Error::InvalidAmount);
+            env.panic_with_error(Error::InvalidAmount);
         }
 
         // In a real implementation, you would handle token transfers here
@@ -295,3 +295,5 @@ impl LendingTrait for SoroSusuLending {
         }
     }
 }
+
+fn main() {}

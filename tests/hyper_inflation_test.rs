@@ -1,5 +1,4 @@
-use sorosusu_contracts::{SoroSusu, SoroSusuClient};
-#![cfg(test)]
+#[cfg(test)]
 use soroban_sdk::testutils::Address as _;
 
 #[test]

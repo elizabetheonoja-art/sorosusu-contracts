@@ -1,11 +1,7 @@
 #![cfg(test)]
 use soroban_sdk::testutils::Address as _;
-
-use soroban_sdk::{
-    contract, contractimpl, token, symbol_short,
-    Address, Env, Symbol
-};
-use sorosusu_contracts::{DataKey, SoroSusu, SoroSusuClient};
+use soroban_sdk::{contract, contractimpl, token, symbol_short, Address, Env, Symbol};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient, DataKey};
 
 #[contract]
 pub struct MockNft;
@@ -29,11 +25,11 @@ fn test_buddy_pairing() {
     let creator = Address::generate(&env);
     let user1 = Address::generate(&env);
     let user2 = Address::generate(&env);
-    
+
     // Register mock token
     let token_admin = Address::generate(&env);
     let token = register_token(&env, &token_admin);
-    
+
     let _nft_contract = env.register_contract(None, MockNft);
 
     let contract_id = env.register_contract(None, SoroSusu);
@@ -69,11 +65,9 @@ fn test_buddy_pairing() {
         let remaining_deposit: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::K2(symbol_short!("Saf"), circle_id, user2.clone()))
+            .get(&DataKey::K1A(symbol_short!("Safe"), user2.clone()))
             .unwrap();
-        // The test expected 1000 but my current mock just transfers. 
-        // I updated set_safety_deposit to store the full amt.
-        assert_eq!(remaining_deposit, 2000); 
+        assert_eq!(remaining_deposit, 2000);
     });
 
     assert_eq!(token_client.balance(&user2), 3000);

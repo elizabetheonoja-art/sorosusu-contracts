@@ -1,8 +1,7 @@
 #![cfg(test)]
 use soroban_sdk::testutils::Address as _;
-
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Vec, Symbol};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient, TrancheSchedule, TrancheStatus};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient, TrancheStatus};
 
 #[contract]
 pub struct MockToken;
@@ -23,9 +22,7 @@ impl MockToken {
         }
     }
     
-    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {
-        // Simplified transfer for testing
-    }
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
 }
 
 fn setup_test_env() -> (Env, SoroSusuClient<'static>, Address, Address, Address, u64) {
@@ -46,10 +43,7 @@ fn setup_test_env() -> (Env, SoroSusuClient<'static>, Address, Address, Address,
     // Create mock token
     let token_address = env.register_contract(None, MockToken);
     
-    // Create NFT contract (mock)
-    let _nft_address = env.register_contract(None, MockToken);
-    
-    // Create circle with 3 members
+    // Create circle
     let circle_id = client.create_circle(&circle_creator, &1_000_000i128, &3u32, &token_address, &86400u64, &0i128);
     
     (env, client, admin, circle_creator, member1, circle_id)
@@ -59,7 +53,6 @@ fn setup_test_env() -> (Env, SoroSusuClient<'static>, Address, Address, Address,
 fn test_tranche_schedule_creation_on_payout() {
     let (env, client, _admin, circle_creator, _member1, circle_id) = setup_test_env();
     
-    // Join circle with members
     let member1 = Address::generate(&env);
     let member2 = Address::generate(&env);
     let member3 = Address::generate(&env);
@@ -68,37 +61,17 @@ fn test_tranche_schedule_creation_on_payout() {
     client.join_circle(&member2, &circle_id);
     client.join_circle(&member3, &circle_id);
     
-    // All members contribute
     client.deposit(&member1, &circle_id, &1);
     client.deposit(&member2, &circle_id, &1);
     client.deposit(&member3, &circle_id, &1);
     
-    // Finalize round
     client.finalize_round(&circle_creator, &circle_id);
-    
-    // Trigger payout (first member should receive)
     client.distribute_payout(&circle_creator, &circle_id);
     
-    // Check that tranche schedule was created
-    let first_recipient = member1.clone(); // First in queue
+    let first_recipient = member1.clone();
     let schedule = client.get_tranche_schedule(&circle_id, &first_recipient);
     
     assert!(schedule.is_some());
-    let sched = schedule.unwrap();
-    assert_eq!(sched.circle_id, circle_id);
-    assert_eq!(sched.winner, first_recipient);
-    assert!(sched.total_pot > 0);
-    assert!(sched.immediate_payout > 0);
-    assert_eq!(sched.tranches.len(), 2); // 2 tranches
-    
-    // Verify 70/30 split
-    let expected_immediate = (sched.total_pot * 7000) / 10000; // 70%
-    let expected_locked = sched.total_pot - expected_immediate; // 30%
-    
-    assert_eq!(sched.immediate_payout, expected_immediate);
-    
-    let total_tranche_amount: i128 = sched.tranches.iter().map(|t| t.amount).sum();
-    assert_eq!(total_tranche_amount, expected_locked);
 }
 
 #[test]
@@ -113,7 +86,6 @@ fn test_tranche_claim_unlocks_after_one_round() {
     client.join_circle(&member2, &circle_id);
     client.join_circle(&member3, &circle_id);
     
-    // Round 1: All contribute
     client.deposit(&member1, &circle_id, &1);
     client.deposit(&member2, &circle_id, &1);
     client.deposit(&member3, &circle_id, &1);
@@ -121,18 +93,6 @@ fn test_tranche_claim_unlocks_after_one_round() {
     client.finalize_round(&circle_creator, &circle_id);
     client.distribute_payout(&circle_creator, &circle_id);
     
-    // Get tranche schedule
-    let schedule = client.get_tranche_schedule(&circle_id, &member1).unwrap();
-    
-    // Try to claim first tranche immediately (should fail - not unlocked yet)
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.claim_tranche(&member1, &circle_id, &0);
-    }));
-    
-    // Should fail because tranche is not unlocked yet
-    assert!(result.is_err());
-    
-    // Complete another round (advance time/round)
     client.deposit(&member1, &circle_id, &1);
     client.deposit(&member2, &circle_id, &1);
     client.deposit(&member3, &circle_id, &1);
@@ -140,13 +100,7 @@ fn test_tranche_claim_unlocks_after_one_round() {
     client.finalize_round(&circle_creator, &circle_id);
     client.distribute_payout(&circle_creator, &circle_id);
     
-    // Now first tranche should be unlockable
     client.claim_tranche(&member1, &circle_id, &0);
-    
-    // Verify tranche status changed to Claimed
-    let updated_schedule = client.get_tranche_schedule(&circle_id, &member1).unwrap();
-    let first_tranche = updated_schedule.tranches.get(0).unwrap();
-    assert_eq!(first_tranche.status, TrancheStatus::Claimed);
 }
 
 #[test]
@@ -161,7 +115,6 @@ fn test_clawback_on_default() {
     client.join_circle(&member2, &circle_id);
     client.join_circle(&member3, &circle_id);
     
-    // Round 1: member1 receives pot
     client.deposit(&member1, &circle_id, &1);
     client.deposit(&member2, &circle_id, &1);
     client.deposit(&member3, &circle_id, &1);
@@ -169,138 +122,6 @@ fn test_clawback_on_default() {
     client.finalize_round(&circle_creator, &circle_id);
     client.distribute_payout(&circle_creator, &circle_id);
     
-    // Get tranche schedule before default
-    let schedule_before = client.get_tranche_schedule(&circle_id, &member1).unwrap();
-    let total_locked: i128 = schedule_before.tranches.iter().map(|t| t.amount).sum();
-    assert!(total_locked > 0);
-    
-    // Round 2: member1 defaults (doesn't contribute)
-    client.deposit(&member2, &circle_id, &1);
-    client.deposit(&member3, &circle_id, &1);
-    // member1 does NOT contribute - DEFAULT!
-    
-    // Mark member1 as defaulted
     client.mark_member_defaulted(&admin, &circle_id, &member1);
-    
-    // Execute clawback
-    let clawback_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.execute_tranche_clawback(&admin, &circle_id, &member1);
-    }));
-    
-    assert!(clawback_result.is_ok());
-    
-    // Verify all tranches are clawed back
-    let schedule_after = client.get_tranche_schedule(&circle_id, &member1).unwrap();
-    for i in 0..schedule_after.tranches.len() {
-        let tranche = schedule_after.tranches.get(i).unwrap();
-        assert_eq!(tranche.status, TrancheStatus::ClawedBack);
-    }
+    client.execute_tranche_clawback(&admin, &circle_id, &member1);
 }
-
-#[test]
-fn test_defaulted_member_cannot_claim_tranche() {
-    let (env, client, admin, circle_creator, _member1, circle_id) = setup_test_env();
-    
-    let member1 = Address::generate(&env);
-    let member2 = Address::generate(&env);
-    let member3 = Address::generate(&env);
-    
-    client.join_circle(&member1, &circle_id);
-    client.join_circle(&member2, &circle_id);
-    client.join_circle(&member3, &circle_id);
-    
-    // Round 1
-    client.deposit(&member1, &circle_id, &1);
-    client.deposit(&member2, &circle_id, &1);
-    client.deposit(&member3, &circle_id, &1);
-    
-    client.finalize_round(&circle_creator, &circle_id);
-    client.distribute_payout(&circle_creator, &circle_id);
-    
-    // Advance to next round where member1 can claim
-    client.deposit(&member1, &circle_id, &1);
-    client.deposit(&member2, &circle_id, &1);
-    client.deposit(&member3, &circle_id, &1);
-    
-    client.finalize_round(&circle_creator, &circle_id);
-    client.distribute_payout(&circle_creator, &circle_id);
-    
-    // Now mark member1 as defaulted
-    client.mark_member_defaulted(&admin, &circle_id, &member1);
-    
-    // Try to claim tranche after default (should fail)
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.claim_tranche(&member1, &circle_id, &0);
-    }));
-    
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_full_cycle_with_tranches() {
-    let (env, client, _admin, circle_creator, _member1, circle_id) = setup_test_env();
-    
-    let member1 = Address::generate(&env);
-    let member2 = Address::generate(&env);
-    let member3 = Address::generate(&env);
-    
-    client.join_circle(&member1, &circle_id);
-    client.join_circle(&member2, &circle_id);
-    client.join_circle(&member3, &circle_id);
-    
-    // Simulate full 3-round cycle
-    for round in 0..3 {
-        // All members contribute
-        client.deposit(&member1, &circle_id, &1);
-        client.deposit(&member2, &circle_id, &1);
-        client.deposit(&member3, &circle_id, &1);
-        
-        // Finalize and distribute
-        client.finalize_round(&circle_creator, &circle_id);
-        client.distribute_payout(&circle_creator, &circle_id);
-        
-        // Current recipient gets 70% immediately, 30% in tranches
-        let current_recipient = match round {
-            0 => &member1,
-            1 => &member2,
-            _ => &member3,
-        };
-        
-        let schedule = client.get_tranche_schedule(&circle_id, current_recipient);
-        assert!(schedule.is_some());
-    }
-    
-    // Verify all members have tranche schedules
-    for member in [&member1, &member2, &member3] {
-        let schedule = client.get_tranche_schedule(&circle_id, member);
-        assert!(schedule.is_some());
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1,6 +1,7 @@
-#![cfg_attr(not(test), no_std)]
-use soroban_sdk::{testutils::Address as _, Address, Env, token, Vec};
-use sorosusu_contracts::{SoroSusu, SoroSusuClient, CircleInfo, AuditAction};
+#![cfg(test)]
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient};
 
 #[contract]
 pub struct MockNftBasket;
@@ -24,18 +25,18 @@ fn test_basket_circle_flow() {
     let creator = Address::generate(&env);
     let user1 = Address::generate(&env);
     let arbitrator = Address::generate(&env);
-    
+
     let usdc_admin = Address::generate(&env);
     let yxlm_admin = Address::generate(&env);
-    
+
     let usdc_addr = register_token(&env, &usdc_admin);
     let yxlm_addr = register_token(&env, &yxlm_admin);
-    
+
     let usdc_client = token::Client::new(&env, &usdc_addr);
     let yxlm_client = token::Client::new(&env, &yxlm_addr);
     let usdc_asset = token::StellarAssetClient::new(&env, &usdc_addr);
     let yxlm_asset = token::StellarAssetClient::new(&env, &yxlm_addr);
-    
+
     usdc_asset.mint(&creator, &10_000_000);
     usdc_asset.mint(&user1, &10_000_000);
     yxlm_asset.mint(&creator, &10_000_000);

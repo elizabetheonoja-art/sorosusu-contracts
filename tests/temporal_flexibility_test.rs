@@ -1,5 +1,5 @@
 use sorosusu_contracts::{SoroSusu, SoroSusuClient};
-#![cfg(test)]
+// #![cfg(test)]
 use soroban_sdk::testutils::Address as _;
 
 // Temporal Flexibility: Dynamic Round Duration Tests
@@ -85,7 +85,7 @@ fn test_quorum_and_majority_combined() {
     let for_v: u32 = 4;
     let quorum_met = (votes * 100) >= (active_members * DURATION_CHANGE_QUORUM);
     let majority_met = (for_v * 100) / votes >= DURATION_CHANGE_MAJORITY;
-    assert!(quorum_met, && majority_met, "6 votes, 4 for should pass");
+    assert!(quorum_met && majority_met, "6 votes, 4 for should pass");
 
     // Case 2: quorum met, majority NOT met -> fails
     let votes2: u32 = 6;
@@ -256,7 +256,7 @@ fn test_three_member_group_vote() {
     let for_v: u32 = 2;
     let quorum_met = (total * 100) >= (active_members * DURATION_CHANGE_QUORUM);
     let majority_met = (for_v * 100) / total >= DURATION_CHANGE_MAJORITY;
-    assert!(quorum_met, && majority_met, "2/3 members voting unanimously should pass");
+    assert!(quorum_met && majority_met, "2/3 members voting unanimously should pass");
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn test_large_group_edge_case() {
     let for_v: u32 = 7;
     let quorum = (total * 100) >= (active_members * DURATION_CHANGE_QUORUM);
     let majority = (for_v * 100) / total >= DURATION_CHANGE_MAJORITY;
-    assert!(quorum, && majority, "7/10 of 20 members should pass");
+    assert!(quorum && majority, "7/10 of 20 members should pass");
 
     // 10 votes, 6 for, 4 against -> 60% majority -> fails
     let for_v2: u32 = 6;
