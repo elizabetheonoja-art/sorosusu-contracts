@@ -29,7 +29,9 @@ fn test_advance_request() {
         on_time_contributions: 10,
         late_contributions: 0
     };
-    env.storage().instance().set(&DataKey::UserStats(member.clone()), &user_stats);
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::UserStats(member.clone()), &user_stats);
+    });
     
     let s_id = env.register_contract(None, SoroSusu);
     let s_client = SoroSusuClient::new(&env, &s_id);
