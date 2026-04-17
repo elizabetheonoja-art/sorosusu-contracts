@@ -5,6 +5,7 @@ use sorosusu_contracts::{SoroSusu, SoroSusuClient, DataKey, DissolutionVoteChoic
 #[test]
 fn test_initiate_dissolution() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, SoroSusu);
     let client = SoroSusuClient::new(&env, &contract_id);
     
@@ -28,6 +29,7 @@ fn test_initiate_dissolution() {
 #[test]
 fn test_dissolution_double_initiation_prevention() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, SoroSusu);
     let client = SoroSusuClient::new(&env, &contract_id);
     
@@ -55,6 +57,7 @@ fn test_dissolution_double_initiation_prevention() {
 #[test]
 fn test_vote_to_dissolve_supermajority() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, SoroSusu);
     let client = SoroSusuClient::new(&env, &contract_id);
     
@@ -81,6 +84,7 @@ fn test_vote_to_dissolve_supermajority() {
 #[test]
 fn test_refund_claim_for_unreimbursed_member() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, SoroSusu);
     let client = SoroSusuClient::new(&env, &contract_id);
     
@@ -103,6 +107,7 @@ fn test_refund_claim_for_unreimbursed_member() {
 #[test]
 fn test_cannot_refund_pot_recipient() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, SoroSusu);
     let client = SoroSusuClient::new(&env, &contract_id);
     
