@@ -1,5 +1,4 @@
-#![cfg(test)]
-
+#[cfg(test)]
 #[test]
 fn test_rate_limit_enforcement() {
     // Simulate timestamps
@@ -35,19 +34,7 @@ fn test_rate_limit_exact_boundary() {
 #[test]
 fn test_rate_limit_multiple_users() {
     // Different users should have independent rate limits
-    struct UserCreation {
-        user_id: u32,
-        timestamp: u64,
-    }
-    
-    let creations = vec![
-        UserCreation { user_id: 1, timestamp: 1000 },
-        UserCreation { user_id: 2, timestamp: 1100 }, // Different user, should be allowed
-        UserCreation { user_id: 1, timestamp: 1200 }, // Same user within 5 min, should fail
-        UserCreation { user_id: 2, timestamp: 1250 }, // User 2 within their 5 min, should fail
-        UserCreation { user_id: 1, timestamp: 1301 }, // User 1 after 5 min, should succeed
-    ];
-    
+
     const RATE_LIMIT_SECONDS: u64 = 300;
     
     // User 1: First creation at 1000
@@ -93,3 +80,32 @@ fn test_rate_limit_constants() {
     
     assert_eq!(RATE_LIMIT_SECONDS, EXPECTED_MINUTES * 60);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

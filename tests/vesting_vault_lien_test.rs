@@ -1,0 +1,82 @@
+#![cfg(test)]
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{contract, contractimpl, token, Address, Env};
+use sorosusu_contracts::{SoroSusu, SoroSusuClient, LienStatus};
+#[contract]
+pub struct MockVestingVault;
+
+#[contractimpl]
+impl MockVestingVault {
+    pub fn get_vesting_balance(_env: Env, _user: Address) -> i128 { 1_000_000_0 }
+    pub fn get_vesting_end_time(env: Env, _user: Address) -> u64 { env.ledger().timestamp() + 86400 * 30 }
+    pub fn create_lien(_env: Env, _user: Address, _amount: i128, _recipient: Address) -> bool { true }
+    pub fn claim_lien(_env: Env, _user: Address, _amount: i128, _claimant: Address) -> bool { true }
+    pub fn release_lien(_env: Env, _user: Address, _amount: i128) -> bool { true }
+}
+
+#[contract]
+pub struct MockToken;
+
+#[contractimpl]
+impl MockToken {
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 { 1_000_000_000_000 }
+    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _live_until_ledger: u32) {}
+    pub fn balance(_env: Env, _account: Address) -> i128 { 1_000_000_000_000 }
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
+}
+
+fn setup_vault_test(env: &Env) -> (SoroSusuClient<'static>, Address, Address, Address, Address) {
+    let admin = Address::generate(env);
+    let creator = Address::generate(env);
+    let member = Address::generate(env);
+    let token_contract = env.register_contract(None, MockToken);
+    let contract_id = env.register_contract(None, SoroSusu);
+    let client = SoroSusuClient::new(env, &contract_id);
+    client.init(&admin, &0);
+    (client, creator, member, token_contract, admin)
+}
+
+#[test]
+fn test_create_vesting_lien() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, member, token_contract, _) = setup_vault_test(&env);
+    let circle_id = client.create_circle(&creator, &2_000_000_0i128, &5u32, &token_contract, &86400u64, &0i128);
+    client.join_circle(&creator, &circle_id);
+    let vault_addr = Address::generate(&env);
+    let lien_amount = 400_000_0i128;
+    let lien_id = client.create_vesting_lien(&member, &circle_id, &vault_addr, &lien_amount);
+    assert_eq!(lien_id, 1);
+    let lien_info = client.get_vesting_lien(&member, &circle_id).unwrap();
+    assert_eq!(lien_info.lien_amount, lien_amount);
+    assert_eq!(lien_info.status, LienStatus::Active);
+}
+
+#[test]
+fn test_join_circle_with_vesting_lien() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, member, token_contract, _) = setup_vault_test(&env);
+    let circle_id = client.create_circle(&creator, &2_000_000_0i128, &5u32, &token_contract, &86400u64, &0i128);
+    client.join_circle(&creator, &circle_id);
+    let vault_addr = Address::generate(&env);
+    client.create_vesting_lien(&member, &circle_id, &vault_addr, &400_000_0i128);
+    client.join_circle(&member, &circle_id);
+    let circle = client.get_circle(&circle_id);
+    assert_eq!(circle.member_count, 2);
+}
+
+#[test]
+fn test_claim_vesting_lien_on_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, creator, member, token_contract, _) = setup_vault_test(&env);
+    let circle_id = client.create_circle(&creator, &2_000_000_0i128, &5u32, &token_contract, &86400u64, &0i128);
+    let vault_addr = Address::generate(&env);
+    client.create_vesting_lien(&member, &circle_id, &vault_addr, &400_000_0i128);
+    client.join_circle(&member, &circle_id);
+    client.mark_member_defaulted(&creator, &circle_id, &member);
+    let member_info = client.get_member(&member);
+    assert_eq!(member_info.status, sorosusu_contracts::MemberStatus::Defaulted);
+}
